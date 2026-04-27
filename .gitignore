@@ -214,3 +214,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+engines/
+input_images/
+outputs/
+trajectory_visualizations/
+trajectory_visualizations_straight/
+trajectory_visualizations_stop/
+trajectory_visualizations_left_turn/
