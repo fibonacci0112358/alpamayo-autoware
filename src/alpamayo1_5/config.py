@@ -17,6 +17,8 @@
 
 from typing import Any
 
+from transformers import AutoConfig
+
 from alpamayo1_5.models.base_model import ReasoningVLAConfig
 
 
@@ -48,3 +50,6 @@ class Alpamayo1_5Config(ReasoningVLAConfig):
         self.expert_non_causal_attention = expert_non_causal_attention
         self.include_camera_ids = include_camera_ids
         self.include_frame_nums = include_frame_nums
+
+
+AutoConfig.register("alpamayo1_5", Alpamayo1_5Config)

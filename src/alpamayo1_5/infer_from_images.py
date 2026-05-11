@@ -48,6 +48,32 @@ def _collect_images(image_dir: Path, recursive: bool) -> list[Path]:
     return paths
 
 
+def _apply_fps_filter(image_paths: list[Path], input_fps: int, output_fps: int) -> list[Path]:
+    """Filter image paths based on input and output fps.
+    
+    Args:
+        image_paths: List of all image paths (assumed to be at input_fps).
+        input_fps: Frame rate of input images (e.g., 30).
+        output_fps: Desired output frame rate (e.g., 10).
+    
+    Returns:
+        Filtered list of image paths at output_fps.
+    """
+    if output_fps > input_fps:
+        raise ValueError(
+            f"Output FPS ({output_fps}) cannot be greater than input FPS ({input_fps})"
+        )
+    
+    if output_fps == input_fps:
+        return image_paths
+    
+    skip_rate = input_fps // output_fps
+    filtered_paths = image_paths[::skip_rate]
+    print(f"FPS filtering: {input_fps}fps -> {output_fps}fps (skip_rate={skip_rate})")
+    print(f"Images: {len(image_paths)} -> {len(filtered_paths)}")
+    return filtered_paths
+
+
 def _build_dummy_history(num_history_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Create zero translation and identity rotation history."""
     ego_history_xyz = torch.zeros((1, 1, num_history_steps, 3), dtype=torch.float32)
@@ -195,6 +221,18 @@ def main() -> None:
         help="Length of dummy ego-history trajectory.",
     )
     parser.add_argument(
+        "--input-fps",
+        type=int,
+        default=30,
+        help="Input frame rate of images (e.g., 30 for 30fps).",
+    )
+    parser.add_argument(
+        "--output-fps",
+        type=int,
+        default=30,
+        help="Desired output frame rate (e.g., 10 for 10fps). Must be <= input-fps.",
+    )
+    parser.add_argument(
         "--dummy-black",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -205,6 +243,14 @@ def main() -> None:
 
     if args.num_frames_per_camera <= 0:
         raise ValueError("--num-frames-per-camera must be > 0")
+
+    if args.input_fps <= 0 or args.output_fps <= 0:
+        raise ValueError("--input-fps and --output-fps must be > 0")
+
+    if args.output_fps > args.input_fps:
+        raise ValueError(
+            f"--output-fps ({args.output_fps}) cannot be greater than --input-fps ({args.input_fps})"
+        )
 
     if not args.dummy_black:
         if args.image_dir is None:
@@ -284,7 +330,10 @@ def main() -> None:
                 print("\nChain-of-Causation:\n", cot_text)
     else:
         # Load all images and process with sliding window
-        all_images = [_load_image_tensor(p) for p in image_paths]
+        all_image_paths = image_paths
+        all_image_paths = _apply_fps_filter(all_image_paths, args.input_fps, args.output_fps)
+        
+        all_images = [_load_image_tensor(p) for p in all_image_paths]
         print(f"Loaded {len(all_images)} images.")
         
         if len(all_images) < args.num_frames_per_camera:

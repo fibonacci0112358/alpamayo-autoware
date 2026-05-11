@@ -216,8 +216,10 @@ __marimo__/
 .streamlit/secrets.toml
 engines/
 input_images/
+input_driving_images/
 outputs/
-trajectory_visualizations/
-trajectory_visualizations_straight/
-trajectory_visualizations_stop/
-trajectory_visualizations_left_turn/
+trajectory_visualizations*/
+
+206_dataset_ver1/
+pai_dataset*/
+Alpamayo-1.5-10B/

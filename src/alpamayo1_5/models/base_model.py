@@ -25,12 +25,14 @@ import numpy as np
 import torch
 from transformers import (
     AutoProcessor,
+    GenerationMixin,
     PretrainedConfig,
     PreTrainedModel,
     Qwen3VLConfig,
     Qwen3VLForConditionalGeneration,
 )
 
+from alpamayo1_5.helper import BASE_PROCESSOR_NAME
 from alpamayo1_5.models.token_utils import extract_text_tokens
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,7 @@ SPECIAL_TOKENS_KEYS = [
     "answer_end",
 ]
 SPECIAL_TOKENS = {k: "<|" + k + "|>" for k in SPECIAL_TOKENS_KEYS}
+DEFAULT_QWEN3VL_ROPE_SCALING = {"rope_type": "default", "mrope_section": [24, 20, 20]}
 
 
 def _recursive_setattr(obj: Any, attr: str, value: Any) -> None:
@@ -90,6 +93,33 @@ def replace_pad_token(input_ids: torch.Tensor, new_ids: torch.Tensor, pad_idx: i
     """Replace pad tokens in input_ids with new token values."""
     mask = input_ids == pad_idx
     return input_ids.masked_scatter(mask, new_ids)
+
+
+def _ensure_qwen3vl_rope_scaling(config: Any) -> None:
+    """Populate Qwen3-VL rope scaling defaults when the checkpoint omits them."""
+    text_config = getattr(config, "text_config", None)
+    if text_config is None:
+        return
+
+    rope_scaling = getattr(text_config, "rope_scaling", None)
+    if rope_scaling is None:
+        text_config.rope_scaling = dict(DEFAULT_QWEN3VL_ROPE_SCALING)
+    elif isinstance(rope_scaling, dict) and "mrope_section" not in rope_scaling:
+        rope_scaling["mrope_section"] = DEFAULT_QWEN3VL_ROPE_SCALING["mrope_section"]
+
+    if getattr(config, "rope_scaling", None) is None:
+        config.rope_scaling = dict(DEFAULT_QWEN3VL_ROPE_SCALING)
+
+
+def _resolve_torch_dtype(model_dtype: Any) -> torch.dtype | None:
+    """Resolve a config dtype string into a torch dtype object."""
+    if isinstance(model_dtype, torch.dtype):
+        return model_dtype
+    if model_dtype is None:
+        return None
+
+    dtype_name = str(model_dtype).lower().replace("torch.", "")
+    return getattr(torch, dtype_name, None)
 
 
 def tokenize_history_trajectory(
@@ -222,6 +252,31 @@ class ReasoningVLAConfig(PretrainedConfig):
         add_special_tokens: bool = False,
         **kwargs: Any,
     ) -> None:
+        # HF config.json may include nested configs as raw dicts. Normalize
+        # them to PretrainedConfig so generation utilities can call `.to_dict()`.
+        def _to_hf_config(maybe_cfg: Any) -> Any:
+            if not isinstance(maybe_cfg, dict):
+                return maybe_cfg
+            model_type = maybe_cfg.get("model_type")
+            if not isinstance(model_type, str):
+                return maybe_cfg
+            try:
+                cfg_kwargs = dict(maybe_cfg)
+                cfg_kwargs.pop("model_type", None)
+                converted = AutoConfig.for_model(model_type, **cfg_kwargs)
+                # Some HF configs still carry nested decoder/encoder dicts.
+                for child_key in ("decoder_config", "encoder_config", "text_config"):
+                    child_cfg = getattr(converted, child_key, None)
+                    if isinstance(child_cfg, dict):
+                        setattr(converted, child_key, _to_hf_config(child_cfg))
+                return converted
+            except Exception:
+                # Keep original payload for unknown custom config layouts.
+                return maybe_cfg
+
+        for nested_key in ("text_config", "vision_config", "decoder"):
+            kwargs[nested_key] = _to_hf_config(kwargs.get(nested_key))
+
         super().__init__(**kwargs)
 
         self.vlm_name_or_path = vlm_name_or_path
@@ -260,7 +315,7 @@ class ReasoningVLAConfig(PretrainedConfig):
         if self.max_pixels is not None:
             processor_kwargs["max_pixels"] = self.max_pixels
 
-        processor = AutoProcessor.from_pretrained(self.vlm_name_or_path, **processor_kwargs)
+        processor = AutoProcessor.from_pretrained(BASE_PROCESSOR_NAME, **processor_kwargs)
         tokenizer = processor.tokenizer
 
         # Add traj tokens to the tokenizer
@@ -286,7 +341,7 @@ class ReasoningVLAConfig(PretrainedConfig):
         return processor
 
 
-class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
+class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
     """Reasoning Vision-Language-Action model."""
 
     config_class: type[ReasoningVLAConfig] = ReasoningVLAConfig
@@ -299,6 +354,41 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         original_vocab_size: int | None = None,
         print_param_count: bool = True,
     ) -> None:
+        # Normalize nested HF text/vision configs that may be loaded as dicts
+        # from Alpamayo checkpoint config.json.
+        def _to_hf_config(maybe_cfg: Any) -> Any:
+            if not isinstance(maybe_cfg, dict):
+                return maybe_cfg
+            model_type = maybe_cfg.get("model_type")
+            if not isinstance(model_type, str):
+                return maybe_cfg
+            try:
+                cfg_kwargs = dict(maybe_cfg)
+                cfg_kwargs.pop("model_type", None)
+                converted = AutoConfig.for_model(model_type, **cfg_kwargs)
+                for child_key in ("decoder_config", "encoder_config", "text_config"):
+                    child_cfg = getattr(converted, child_key, None)
+                    if isinstance(child_cfg, dict):
+                        setattr(converted, child_key, _to_hf_config(child_cfg))
+                return converted
+            except Exception:
+                return maybe_cfg
+
+        for attr_name in ("text_config", "vision_config", "decoder", "decoder_config"):
+            if not hasattr(config, attr_name):
+                continue
+            attr_value = getattr(config, attr_name)
+            normalized = _to_hf_config(attr_value)
+            # Drop malformed dict payloads (e.g. {"rope_scaling": ...}) so
+            # GenerationConfig falls back to the parent config object.
+            if isinstance(normalized, dict) and "model_type" not in normalized:
+                try:
+                    delattr(config, attr_name)
+                except Exception:
+                    setattr(config, attr_name, None)
+            else:
+                setattr(config, attr_name, normalized)
+
         super().__init__(config)
 
         if pretrained_modules is not None:
@@ -336,7 +426,7 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         if config.max_pixels is not None:
             processor_kwargs["max_pixels"] = config.max_pixels
 
-        processor = AutoProcessor.from_pretrained(config.vlm_name_or_path, **processor_kwargs)
+        processor = AutoProcessor.from_pretrained(BASE_PROCESSOR_NAME, **processor_kwargs)
         tokenizer = processor.tokenizer
 
         if config.traj_vocab_size is not None:
@@ -376,9 +466,10 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         """
         vlm_config = Qwen3VLConfig.from_pretrained(
             config.vlm_name_or_path,
-            dtype=config.model_dtype,
+            dtype=_resolve_torch_dtype(config.model_dtype),
             attn_implementation=config.attn_implementation,
         )
+        _ensure_qwen3vl_rope_scaling(vlm_config)
         self.original_vocab_size = vlm_config.text_config.vocab_size
         vlm_config.text_config.vocab_size = config.vocab_size
         vlm_config.vocab_size = config.vocab_size
@@ -415,9 +506,10 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         # Load VLM
         vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             config.vlm_name_or_path,
-            dtype=config.model_dtype,
+            dtype=_resolve_torch_dtype(config.model_dtype),
             attn_implementation=config.attn_implementation,
         )
+        _ensure_qwen3vl_rope_scaling(vlm.config)
 
         original_vocab_size = vlm.config.text_config.vocab_size
         vlm.resize_token_embeddings(config.vocab_size)
