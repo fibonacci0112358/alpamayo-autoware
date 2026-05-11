@@ -214,7 +214,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
 engines/
+log/
+install/
 input_images/
 input_driving_images/
 outputs/
@@ -223,3 +226,4 @@ trajectory_visualizations*/
 206_dataset_ver1/
 pai_dataset*/
 Alpamayo-1.5-10B/
+

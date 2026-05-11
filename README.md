@@ -111,6 +111,10 @@ Request access: [Alpamayo-1.5-10B](https://huggingface.co/nvidia/Alpamayo-1.5-10
 source /opt/ros/humble/setup.bash
 source a1_5_venv/bin/activate
 
+# One-time build for this workspace
+colcon build --packages-select alpamayo_ros --symlink-install
+source install/setup.bash
+
 # Direct execution
 python3 ./src/alpamayo_ros/alpamayo_ros/alpamayo_node.py --ros-args \
   -p camera_topics:="['/sensing/camera/camera3/image_raw/compressed', \
@@ -142,6 +146,10 @@ The script exports `expert_step.int8.qdq.onnx` and caches the compiled TRT engin
 **Step 2: Run node** (Python 3.10, ROS 2 Humble):
 
 ```bash
+source /opt/ros/humble/setup.bash
+source a1_5_venv/bin/activate
+source install/setup.bash
+
 ros2 launch alpamayo_ros alpamayo.launch.py \
   expert_onnx_path:=/path/to/your/engines/expert_step.int8.qdq.onnx \
   num_diffusion_steps:=5 \
@@ -152,6 +160,9 @@ ros2 launch alpamayo_ros alpamayo.launch.py \
 
 ```bash
 # Terminal 1: launch with sim time
+source /opt/ros/humble/setup.bash
+source a1_5_venv/bin/activate
+source install/setup.bash
 ros2 launch alpamayo_ros alpamayo.launch.py use_sim_time:=true
 
 # Terminal 2: play bag

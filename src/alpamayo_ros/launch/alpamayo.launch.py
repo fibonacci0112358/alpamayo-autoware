@@ -18,6 +18,7 @@ def generate_launch_description() -> LaunchDescription:
             Node(
                 package="alpamayo_ros",
                 executable="alpamayo_node",
+                prefix=["python3"],
                 name="alpamayo_node",
                 output="screen",
                 parameters=[
