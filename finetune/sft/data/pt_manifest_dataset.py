@@ -37,6 +37,9 @@ class PtManifestDataset(Dataset):
         manifest_path: str | Path,
         image_root: str | Path | None = None,
         default_num_frames_per_camera: int = 4,
+        include_camera_ids: bool = True,
+        include_frame_nums: bool = True,
+        use_nav_prompt: bool = False,
         chunk_ids: list[int] | tuple[int, ...] | int | str | None = None,
         file_start: int | None = None,
         file_end: int | None = None,
@@ -44,6 +47,9 @@ class PtManifestDataset(Dataset):
         self.manifest_path = Path(manifest_path)
         self.image_root = Path(image_root) if image_root is not None else None
         self.default_num_frames_per_camera = default_num_frames_per_camera
+        self.include_camera_ids = include_camera_ids
+        self.include_frame_nums = include_frame_nums
+        self.use_nav_prompt = use_nav_prompt
         self.records = _read_manifest(self.manifest_path)
 
         # Optional chunk-based filtering if manifest records include a 'chunk' field.
@@ -84,6 +90,9 @@ class PtManifestDataset(Dataset):
             raise ValueError("PtManifestDataset expects 'file' field in manifest records")
         pt_path = _resolve_path(self.image_root or self.manifest_path.parent, file_field)
         payload = torch.load(pt_path, map_location="cpu")
+        payload.setdefault("include_camera_ids", self.include_camera_ids)
+        payload.setdefault("include_frame_nums", self.include_frame_nums)
+        payload.setdefault("use_nav_prompt", self.use_nav_prompt)
         return payload
 
 
@@ -130,6 +139,9 @@ class PtManifestCollator:
                     camera_indices=camera_indices,
                     num_frames_per_camera=num_frames_per_camera,
                     nav_text=nav_text,
+                    use_nav_prompt=bool(sample.get("use_nav_prompt", False)),
+                    include_camera_ids=bool(sample.get("include_camera_ids", True)),
+                    include_frame_nums=bool(sample.get("include_frame_nums", True)),
                 )
 
             if sample.get("completion"):

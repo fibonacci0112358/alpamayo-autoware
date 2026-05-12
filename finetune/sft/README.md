@@ -89,4 +89,4 @@ python3 finetune/sft/train_hf_1_5.py \
 
 Next steps
 - Integrate a minimal HF Trainer or custom training loop; add dataset collate functions.
-- Implement accurate action/expert loss in `sft_alpamayo_1_5_stage2.py` based on Alpamayo1.5 internals.
+- Stage2 action/expert diffusion loss is implemented in `sft_alpamayo_1_5_stage2.py`; next work is tightening the batch schema and adding a real data-backed integration test.

@@ -39,6 +39,8 @@ def _build_image_content(
     frames: torch.Tensor,
     camera_indices: torch.Tensor | None = None,
     num_frames_per_camera: int = 4,
+    include_camera_ids: bool = True,
+    include_frame_nums: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the image portion of the user message content.
 
@@ -53,7 +55,7 @@ def _build_image_content(
             ``N_cameras * num_frames_per_camera``.
         num_frames_per_camera: Number of temporal frames per camera.
     """
-    if camera_indices is None:
+    if camera_indices is None or (not include_camera_ids and not include_frame_nums):
         return [{"type": "image", "image": frame} for frame in frames]
 
     expanded_cam_ids = camera_indices.repeat_interleave(num_frames_per_camera)
@@ -64,10 +66,11 @@ def _build_image_content(
         cam_id = expanded_cam_ids[i].item()
         if prev_cam_id is not None and cam_id != prev_cam_id:
             frame_idx = 0
-        if frame_idx == 0:
+        if frame_idx == 0 and include_camera_ids:
             cam_name = CAMERA_DISPLAY_NAMES.get(cam_id, f"Camera {cam_id}")
             content.append({"type": "text", "text": f"{cam_name}: "})
-        content.append({"type": "text", "text": f"frame {frame_idx} "})
+        if include_frame_nums:
+            content.append({"type": "text", "text": f"frame {frame_idx} "})
         content.append({"type": "image", "image": frame})
         prev_cam_id = cam_id
         frame_idx += 1
@@ -80,6 +83,8 @@ def create_message(
     num_frames_per_camera: int = 4,
     nav_text: str | None = None,
     use_nav_prompt: bool = False,
+    include_camera_ids: bool = True,
+    include_frame_nums: bool = True,
 ):
     """Construct the chat message for model inference.
 
@@ -122,7 +127,13 @@ def create_message(
 
     user_text = f"{hist_traj_placeholder}{route_section}{prompt_text}"
 
-    image_content = _build_image_content(frames, camera_indices, num_frames_per_camera)
+    image_content = _build_image_content(
+        frames,
+        camera_indices,
+        num_frames_per_camera,
+        include_camera_ids=include_camera_ids,
+        include_frame_nums=include_frame_nums,
+    )
 
     return [
         {
@@ -150,6 +161,8 @@ def create_vqa_message(
     question: str,
     camera_indices: torch.Tensor | None = None,
     num_frames_per_camera: int = 4,
+    include_camera_ids: bool = True,
+    include_frame_nums: bool = True,
 ):
     """Construct the chat message for model inference.
 
@@ -167,7 +180,13 @@ def create_vqa_message(
     assert frames.ndim == 4, f"{frames.ndim=}, expected (N, C, H, W)"
     user_text = f"<|question_start|>{question}<|question_end|>"
 
-    image_content = _build_image_content(frames, camera_indices, num_frames_per_camera)
+    image_content = _build_image_content(
+        frames,
+        camera_indices,
+        num_frames_per_camera,
+        include_camera_ids=include_camera_ids,
+        include_frame_nums=include_frame_nums,
+    )
 
     return [
         {

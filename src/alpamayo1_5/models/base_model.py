@@ -354,40 +354,40 @@ class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
         original_vocab_size: int | None = None,
         print_param_count: bool = True,
     ) -> None:
-        # Normalize nested HF text/vision configs that may be loaded as dicts
-        # from Alpamayo checkpoint config.json.
-        def _to_hf_config(maybe_cfg: Any) -> Any:
-            if not isinstance(maybe_cfg, dict):
-                return maybe_cfg
-            model_type = maybe_cfg.get("model_type")
-            if not isinstance(model_type, str):
-                return maybe_cfg
-            try:
-                cfg_kwargs = dict(maybe_cfg)
-                cfg_kwargs.pop("model_type", None)
-                converted = AutoConfig.for_model(model_type, **cfg_kwargs)
-                for child_key in ("decoder_config", "encoder_config", "text_config"):
-                    child_cfg = getattr(converted, child_key, None)
-                    if isinstance(child_cfg, dict):
-                        setattr(converted, child_key, _to_hf_config(child_cfg))
-                return converted
-            except Exception:
-                return maybe_cfg
-
-        for attr_name in ("text_config", "vision_config", "decoder", "decoder_config"):
-            if not hasattr(config, attr_name):
-                continue
-            attr_value = getattr(config, attr_name)
-            normalized = _to_hf_config(attr_value)
-            # Drop malformed dict payloads (e.g. {"rope_scaling": ...}) so
-            # GenerationConfig falls back to the parent config object.
-            if isinstance(normalized, dict) and "model_type" not in normalized:
+        # Normalize nested HF configs before calling PreTrainedModel.__init__.
+        # Some Alpamayo checkpoint config.json files carry raw dict payloads in
+        # `decoder` / `text_config` / `vision_config`, which breaks
+        # GenerationConfig.from_model_config if they are left untouched.
+        def _sanitize_config(cfg: ReasoningVLAConfig) -> ReasoningVLAConfig:
+            def _to_hf_config(maybe_cfg: Any) -> Any:
+                if not isinstance(maybe_cfg, dict):
+                    return maybe_cfg
+                model_type = maybe_cfg.get("model_type")
+                if not isinstance(model_type, str):
+                    return None
                 try:
-                    delattr(config, attr_name)
+                    cfg_kwargs = dict(maybe_cfg)
+                    cfg_kwargs.pop("model_type", None)
+                    converted = AutoConfig.for_model(model_type, **cfg_kwargs)
+                    for child_key in ("decoder_config", "encoder_config", "text_config"):
+                        child_cfg = getattr(converted, child_key, None)
+                        if isinstance(child_cfg, dict):
+                            setattr(converted, child_key, _to_hf_config(child_cfg))
+                    return converted
                 except Exception:
-                    setattr(config, attr_name, None)
-            else:
-                setattr(config, attr_name, normalized)
+                    return None
+
+            cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg.__dict__)
+            for attr_name in ("text_config", "vision_config", "decoder", "decoder_config"):
+                if attr_name not in cfg_dict:
+                    continue
+                normalized = _to_hf_config(cfg_dict.get(attr_name))
+                # Drop malformed dict payloads so GenerationConfig uses the
+                # parent config instead of recursing into raw dicts.
+                cfg_dict[attr_name] = normalized
+            return cfg.__class__.from_dict(cfg_dict)
+
+        config = _sanitize_config(config)
 
         super().__init__(config)
 
@@ -464,6 +464,17 @@ class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
         Qwen3-VL uses Qwen3VLForConditionalGeneration from transformers.
         See: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct
         """
+        target_vocab_size = getattr(config, "vocab_size", None)
+        try:
+            processor = AutoProcessor.from_pretrained(
+                config.vlm_name_or_path,
+                min_pixels=config.min_pixels,
+                max_pixels=config.max_pixels,
+            )
+            target_vocab_size = len(processor.tokenizer)
+        except Exception:
+            pass
+
         vlm_config = Qwen3VLConfig.from_pretrained(
             config.vlm_name_or_path,
             dtype=_resolve_torch_dtype(config.model_dtype),
@@ -471,8 +482,9 @@ class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
         )
         _ensure_qwen3vl_rope_scaling(vlm_config)
         self.original_vocab_size = vlm_config.text_config.vocab_size
-        vlm_config.text_config.vocab_size = config.vocab_size
-        vlm_config.vocab_size = config.vocab_size
+        if target_vocab_size is not None:
+            vlm_config.text_config.vocab_size = target_vocab_size
+            vlm_config.vocab_size = target_vocab_size
         self.vlm = Qwen3VLForConditionalGeneration(vlm_config)
 
     def _initialize_trajectory_tokenizers(
@@ -504,6 +516,17 @@ class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
         pretrained_modules = {}
 
         # Load VLM
+        target_vocab_size = getattr(config, "vocab_size", None)
+        try:
+            processor = AutoProcessor.from_pretrained(
+                config.vlm_name_or_path,
+                min_pixels=config.min_pixels,
+                max_pixels=config.max_pixels,
+            )
+            target_vocab_size = len(processor.tokenizer)
+        except Exception:
+            pass
+
         vlm = Qwen3VLForConditionalGeneration.from_pretrained(
             config.vlm_name_or_path,
             dtype=_resolve_torch_dtype(config.model_dtype),
@@ -512,9 +535,10 @@ class ReasoningVLA(PreTrainedModel, GenerationMixin, TrajectoryFusionMixin):
         _ensure_qwen3vl_rope_scaling(vlm.config)
 
         original_vocab_size = vlm.config.text_config.vocab_size
-        vlm.resize_token_embeddings(config.vocab_size)
-        vlm.config.text_config.vocab_size = config.vocab_size
-        vlm.config.vocab_size = config.vocab_size
+        if target_vocab_size is not None:
+            vlm.resize_token_embeddings(target_vocab_size)
+            vlm.config.text_config.vocab_size = target_vocab_size
+            vlm.config.vocab_size = target_vocab_size
         pretrained_modules["vlm"] = vlm
 
         if config.traj_tokenizer_cfg is not None:

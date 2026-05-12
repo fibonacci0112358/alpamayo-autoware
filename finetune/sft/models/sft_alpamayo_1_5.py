@@ -64,6 +64,7 @@ class TrainableAlpamayo1_5(Alpamayo1_5):
                     config.vlm_name_or_path,
                     torch_dtype=_resolve_torch_dtype(config.model_dtype),
                     attn_implementation=config.attn_implementation,
+                    ignore_mismatched_sizes=True,
                 )
             except Exception as e:
                 # The current Alpamayo HF implementation may reject FA2.
@@ -77,6 +78,7 @@ class TrainableAlpamayo1_5(Alpamayo1_5):
                         config.vlm_name_or_path,
                         torch_dtype=_resolve_torch_dtype(config.model_dtype),
                         attn_implementation=None,
+                        ignore_mismatched_sizes=True,
                     )
                 else:
                     raise
@@ -88,6 +90,17 @@ class TrainableAlpamayo1_5(Alpamayo1_5):
                 vlm = loaded_alpamayo.vlm
                 _ensure_qwen3vl_rope_scaling(vlm.config)
                 original_vocab_size = vlm.config.text_config.vocab_size
+
+                target_vocab_size = len(getattr(loaded_alpamayo, "tokenizer", []) or [])
+                if target_vocab_size > 0 and target_vocab_size != vlm.config.vocab_size:
+                    logger.info(
+                        "Resizing Alpamayo VLM embeddings from %s to tokenizer length %s",
+                        vlm.config.vocab_size,
+                        target_vocab_size,
+                    )
+                    vlm.resize_token_embeddings(target_vocab_size, mean_resizing=False)
+                    vlm.config.text_config.vocab_size = target_vocab_size
+                    vlm.config.vocab_size = target_vocab_size
 
                 # Keep vocab aligned with checkpoint to avoid embedding reinit.
                 if getattr(config, "vocab_size", None) != vlm.config.vocab_size:

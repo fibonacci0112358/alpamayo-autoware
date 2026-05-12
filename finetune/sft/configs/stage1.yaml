@@ -67,7 +67,7 @@ training:
   num_train_epochs: 3.0
   max_steps: -1
   logging_steps: 10
-  save_steps: 200
+  save_strategy: "epoch"
   save_total_limit: 2
   evaluation_strategy: "no"
   eval_steps: null

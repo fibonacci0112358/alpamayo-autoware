@@ -40,13 +40,19 @@ def run_toy_test(device: str = "cpu") -> None:
     print("Loss (after one step):", float(loss2))
 
 
-def try_instantiate_vlm(device: str = "cpu") -> None:
+def try_instantiate_vlm(device: str = "cpu", vlm_name_or_path: str | None = None) -> None:
     try:
         from finetune.sft.models.sft_alpamayo_1_5 import TrainableAlpamayo1_5
 
         print("Found TrainableAlpamayo1_5 class; attempting to instantiate with minimal args")
         try:
-            model = TrainableAlpamayo1_5(config=None)
+            if vlm_name_or_path:
+                from types import SimpleNamespace
+
+                cfg = SimpleNamespace(vlm_name_or_path=vlm_name_or_path, model_dtype="auto", attn_implementation=None)
+                model = TrainableAlpamayo1_5(config=cfg)
+            else:
+                model = TrainableAlpamayo1_5(config=None)
             print("Instantiated TrainableAlpamayo1_5 (may be incomplete). Running param count...")
             try:
                 cnt = sum(p.numel() for p in model.parameters())
@@ -70,7 +76,16 @@ def main() -> int:
         action="store_true",
         help="Try to instantiate TrainableAlpamayo1_5 (may fail without proper config)",
     )
-
+    parser.add_argument(
+        "--stage2",
+        action="store_true",
+        help="Run a minimal Stage2 compute_action_loss smoke test",
+    )
+    parser.add_argument(
+        "--vlm-name-or-path",
+        default=None,
+        help="Path or HF id for the Alpamayo1.5 VLM base checkpoint to instantiate (optional)",
+    )
     args = parser.parse_args()
 
     device = args.device
@@ -81,7 +96,62 @@ def main() -> int:
     run_toy_test(device)
 
     if args.use_vlm:
-        try_instantiate_vlm(device)
+        try_instantiate_vlm(device, args.vlm_name_or_path)
+
+    if args.stage2:
+        try:
+            from finetune.sft.models.sft_alpamayo_1_5_stage2 import (
+                TrainableAlpamayo1_5_Stage2,
+            )
+
+            print("Found TrainableAlpamayo1_5_Stage2; running compute_action_loss test")
+            model = None
+            try:
+                # Try to instantiate with a minimal config; allow failures
+                if args.vlm_name_or_path:
+                    from types import SimpleNamespace
+
+                    cfg = SimpleNamespace(vlm_name_or_path=args.vlm_name_or_path, model_dtype="auto", attn_implementation=None)
+                    model = TrainableAlpamayo1_5_Stage2(config=cfg)
+                else:
+                    model = TrainableAlpamayo1_5_Stage2(config=None)
+                print("Instantiated Stage2 wrapper (may be incomplete)")
+            except Exception as e:
+                print("Instantiation failed (continuing with static test):", e)
+
+            # Create fake model outputs and labels to exercise compute_action_loss
+            B, T, C = 2, 4, 3
+            pred = torch.randn((B, T, C), device=device)
+            labels = torch.randn((B, T, C), device=device)
+            model_outputs = {"pred": pred}
+
+            if model is not None:
+                try:
+                    loss = model.compute_action_loss(model_outputs, labels)
+                    print("compute_action_loss (model):", float(loss))
+                except Exception as e:
+                    print("compute_action_loss (model) failed:", e)
+
+            # Exercise compute_action_loss by creating a minimal dummy `self`
+            try:
+                from finetune.sft.models.sft_alpamayo_1_5_stage2 import (
+                    TrainableAlpamayo1_5_Stage2 as _Dummy,
+                )
+
+                class _MinimalSelf:
+                    def parameters(self):
+                        # provide at least one parameter so .device can be resolved
+                        p = torch.nn.Parameter(torch.zeros(1))
+                        return iter([p])
+
+                dummy = _MinimalSelf()
+                loss = _Dummy.compute_action_loss(dummy, model_outputs, labels)
+                print("compute_action_loss (static):", float(loss))
+            except Exception as e:
+                print("Static compute_action_loss test failed:", e)
+
+        except Exception as e:
+            print("Could not run Stage2 test:", e)
 
     return 0
 

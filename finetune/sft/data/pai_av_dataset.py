@@ -503,6 +503,9 @@ class PaiAvR1VlmSftDataset(Dataset):
         local_dir: str | Path,
         chunk_ids: list[int] | tuple[int, ...] | int | str | None = None,
         use_default_keyframe: bool = False,
+        include_camera_ids: bool = True,
+        include_frame_nums: bool = True,
+        use_nav_prompt: bool = False,
         features_metadata: str = "features.csv",
         clip_index_metadata: str = "clip_index.parquet",
         num_history_steps: int = DEFAULT_HISTORY_STEPS,
@@ -522,6 +525,9 @@ class PaiAvR1VlmSftDataset(Dataset):
         )
         self.clip_ids = self.avdi.get_all_clip_ids()
         self.use_default_keyframe = use_default_keyframe
+        self.include_camera_ids = include_camera_ids
+        self.include_frame_nums = include_frame_nums
+        self.use_nav_prompt = use_nav_prompt
         self.num_history_steps = num_history_steps
         self.num_future_steps = num_future_steps
         self.time_step = time_step
@@ -565,6 +571,9 @@ class PaiAvR1VlmSftDataset(Dataset):
             "camera_indices": sample["camera_indices"],
             "num_frames_per_camera": int(n_frame),
             "nav_text": self.nav_text,
+            "use_nav_prompt": self.use_nav_prompt,
+            "include_camera_ids": self.include_camera_ids,
+            "include_frame_nums": self.include_frame_nums,
             "completion": self.completion or "",
             "messages": None,
             "ego_history_xyz": sample.get("ego_history_xyz"),
@@ -602,6 +611,9 @@ class PaiAvVlmSftCollator:
             camera_indices=sample["camera_indices"],
             num_frames_per_camera=int(sample["num_frames_per_camera"]),
             nav_text=sample.get("nav_text"),
+            use_nav_prompt=bool(sample.get("use_nav_prompt", False)),
+            include_camera_ids=bool(sample.get("include_camera_ids", True)),
+            include_frame_nums=bool(sample.get("include_frame_nums", True)),
         )
         if sample.get("completion"):
             messages[-1]["content"].append({"type": "text", "text": str(sample["completion"])})

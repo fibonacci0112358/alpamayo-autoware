@@ -1,6 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import logging
@@ -101,17 +99,10 @@ def _build_dataset_from_cfg(
     ), use_pt
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="stage1")
+@hydra.main(version_base=None, config_path="configs", config_name="stage2")
 def train(cfg: DictConfig) -> None:
-    """Stage1 entrypoint for Alpamayo1.5.
-
-    When `cfg.data.manifest_path` is present, this script runs a minimal
-    PaiAV-style supervised fine-tuning loop using Hugging Face Trainer.
-    Otherwise it only instantiates the model and prints the config.
-    """
-
     print("Resolved config:\n", OmegaConf.to_yaml(cfg))
-    logger.info("Stage1 entrypoint started")
+    logger.info("Stage2 entrypoint started")
 
     lora_kwargs = {}
     if OmegaConf.is_config(cfg) and _get(cfg, "lora.use_lora", False):
@@ -129,44 +120,12 @@ def train(cfg: DictConfig) -> None:
         model_config = model_cfg.get("config")
         if isinstance(model_config, dict):
             model_cfg["config"] = Alpamayo1_5Config(**model_config)
-            # Ensure rope_scaling is set for Qwen3VL compatibility
             _ensure_qwen3vl_rope_scaling(model_cfg["config"])
-            # If a local copy of the base model exists at repo root, prefer it
-            try:
-                local_base = REPO_ROOT / "Alpamayo-1.5-10B"
-                if getattr(model_cfg["config"], "vlm_name_or_path", None) is None and local_base.exists():
-                    model_cfg["config"].vlm_name_or_path = str(local_base)
-            except Exception:
-                pass
-            # Provide a sensible default action_space_cfg when not provided
-            if getattr(model_cfg["config"], "action_space_cfg", None) is None:
-                model_cfg["config"].action_space_cfg = {
-                    "_target_": "alpamayo1_5.action_space.unicycle_accel_curvature.UnicycleAccelCurvatureActionSpace"
-                }
-            # Provide defaults for diffusion and action projection modules
-            if getattr(model_cfg["config"], "diffusion_cfg", None) is None:
-                model_cfg["config"].diffusion_cfg = {
-                    "_target_": "alpamayo1_5.diffusion.flow_matching.FlowMatching",
-                }
-            if getattr(model_cfg["config"], "action_in_proj_cfg", None) is None:
-                model_cfg["config"].action_in_proj_cfg = {
-                    "_target_": "alpamayo1_5.models.action_in_proj.PerWaypointActionInProjV2",
-                }
-            if getattr(model_cfg["config"], "action_out_proj_cfg", None) is None:
-                model_cfg["config"].action_out_proj_cfg = {
-                    "_target_": "torch.nn.Linear",
-                }
 
         model_cls = hyu.get_class(target)
         model = model_cls(**model_cfg, **lora_kwargs)
     else:
         model = hyu.instantiate(cfg.model, _convert_="partial", **lora_kwargs)
-
-    try:
-        param_count = sum(p.numel() for p in model.parameters())
-        print(f"Instantiated model parameters: {param_count:,}")
-    except Exception:
-        print("Model instantiated (could not count params)")
 
     manifest_path = _get(cfg, "data.manifest_path")
     local_dir = _get(cfg, "data.local_dir")
@@ -177,8 +136,7 @@ def train(cfg: DictConfig) -> None:
     valid_file_start = _get(cfg, "data.valid_file_start")
     valid_file_end = _get(cfg, "data.valid_file_end")
     if not manifest_path and not local_dir:
-        print("\nNext: provide cfg.data.manifest_path or cfg.data.local_dir to run Stage1 training.")
-        print("If you want, I can add a small-batch test harness to run forward/backward.")
+        print("\nNext: provide cfg.data.manifest_path or cfg.data.local_dir to run Stage2 training.")
         return
 
     image_root = _get(cfg, "data.image_root")
@@ -227,13 +185,7 @@ def train(cfg: DictConfig) -> None:
     collator = PtManifestCollator(processor=processor) if use_pt else PaiAvVlmSftCollator(processor=processor)
 
     training_cfg = cfg.get("training", {})
-    try:
-        use_lora_flag = bool(_get(cfg, "lora.use_lora", False))
-    except Exception:
-        use_lora_flag = False
-
     report_to = _get(training_cfg, "report_to", [])
-    # Handle OmegaConf ListConfig and strings
     try:
         from omegaconf import ListConfig
     except Exception:
@@ -246,24 +198,22 @@ def train(cfg: DictConfig) -> None:
     elif isinstance(report_to, str):
         report_to = [report_to]
 
-    # Transformers Trainer expects `report_to=None` when no integrations
     if isinstance(report_to, (list, tuple)) and len(report_to) == 0:
         report_to = None
 
     eval_strategy = str(_get(training_cfg, "eval_strategy", "no"))
-    save_strategy = str(_get(training_cfg, "save_strategy", "steps"))
     eval_steps_val = _get(training_cfg, "eval_steps")
     eval_steps = int(eval_steps_val) if eval_steps_val is not None else None
 
     training_args = TrainingArguments(
-        output_dir=str(_get(training_cfg, "output_dir", "outputs/stage1")),
+        output_dir=str(_get(training_cfg, "output_dir", "outputs/stage2")),
         per_device_train_batch_size=int(_get(training_cfg, "per_device_train_batch_size", 1)),
         gradient_accumulation_steps=int(_get(training_cfg, "gradient_accumulation_steps", 1)),
         learning_rate=float(_get(training_cfg, "learning_rate", 1e-5)),
         num_train_epochs=float(_get(training_cfg, "num_train_epochs", 1.0)),
         max_steps=int(_get(training_cfg, "max_steps", -1)),
         logging_steps=int(_get(training_cfg, "logging_steps", 10)),
-        save_steps=int(_get(training_cfg, "save_steps", 100)) if not use_lora_flag else int(1e9),
+        save_steps=int(_get(training_cfg, "save_steps", 100)),
         save_total_limit=int(_get(training_cfg, "save_total_limit", 2)),
         bf16=bool(_get(training_cfg, "bf16", True)),
         fp16=bool(_get(training_cfg, "fp16", False)),
@@ -272,15 +222,9 @@ def train(cfg: DictConfig) -> None:
         report_to=report_to,
         optim=str(_get(training_cfg, "optim", "adamw_torch")),
         warmup_ratio=float(_get(training_cfg, "warmup_ratio", 0.03)),
-        save_strategy=save_strategy,
-        eval_strategy=eval_strategy,
+        evaluation_strategy=eval_strategy,
         eval_steps=eval_steps,
     )
-
-    if use_lora_flag:
-        # LoRA training only needs the adapter at the end; avoid writing full
-        # model checkpoints during training to keep disk usage bounded.
-        training_args.save_strategy = "no"
 
     trainer_kwargs = dict(
         model=model,
@@ -288,50 +232,23 @@ def train(cfg: DictConfig) -> None:
         train_dataset=dataset,
         data_collator=collator,
     )
-    # If eval_dataset exists, auto-enable "steps" evaluation strategy if not already set
     if eval_dataset is not None:
         trainer_kwargs['eval_dataset'] = eval_dataset
-        # Regenerate training_args with eval_strategy="steps" if currently "no"
         if eval_strategy == "no":
             if eval_steps is None:
-                eval_steps = max(1, len(dataset) // 10)  # Default: every 10% of training
+                eval_steps = max(1, len(dataset) // 10)
             training_args.eval_strategy = "steps"
             training_args.eval_steps = eval_steps
             print(f"Auto-enabling evaluation: eval_strategy=steps, eval_steps={eval_steps}, eval_dataset_size={len(eval_dataset)}")
 
     trainer = Trainer(**trainer_kwargs)
 
-    print(f"Starting training on {len(dataset)} samples -> {training_args.output_dir}")
+    print(f"Starting Stage2 training on {len(dataset)} samples -> {training_args.output_dir}")
     trainer.train()
-    if use_lora_flag:
-        # Save model weights, config, and PEFT adapter for subsequent merging
-        trainer.save_model(training_args.output_dir)
-        model.tokenizer.save_pretrained(training_args.output_dir)
-        processor.save_pretrained(training_args.output_dir)
-        try:
-            import os
-            from peft import PeftModel
-
-            adapter_dir = os.path.join(str(training_args.output_dir), "lora_adapter")
-            os.makedirs(adapter_dir, exist_ok=True)
-
-            vlm = getattr(model, "vlm", None)
-            if vlm is not None and isinstance(vlm, PeftModel):
-                vlm.save_pretrained(adapter_dir, safe_serialization=True)
-                print(f"Saved LoRA adapter to {adapter_dir}")
-            elif isinstance(model, PeftModel):
-                model.save_pretrained(adapter_dir, safe_serialization=True)
-                print(f"Saved LoRA adapter to {adapter_dir}")
-            else:
-                print("Warning: lora.use_lora=true but no PeftModel was found; adapter not saved")
-        except Exception as e:
-            print(f"Exception during LoRA adapter save: {e}")
-        print(f"Saved LoRA checkpoint, adapter, and tokenizer to {training_args.output_dir}")
-    else:
-        trainer.save_model(training_args.output_dir)
-        model.tokenizer.save_pretrained(training_args.output_dir)
-        processor.save_pretrained(training_args.output_dir)
-        print(f"Saved checkpoint and tokenizer to {training_args.output_dir}")
+    trainer.save_model(training_args.output_dir)
+    model.tokenizer.save_pretrained(training_args.output_dir)
+    processor.save_pretrained(training_args.output_dir)
+    print(f"Saved checkpoint and tokenizer to {training_args.output_dir}")
 
 
 if __name__ == "__main__":
