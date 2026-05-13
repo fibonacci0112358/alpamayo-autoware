@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a split TensorRT engine for Alpamayo's expert denoiser."
     )
-    parser.add_argument("--model-id", default="nvidia/Alpamayo-R1-10B")
+    parser.add_argument("--model-id", default="nvidia/Alpamayo-1.5-10B")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--clip-id", default=DEFAULT_CLIP_ID)
     parser.add_argument("--t0-us", type=int, default=DEFAULT_T0_US)
@@ -164,6 +164,61 @@ def main() -> None:
     )
 
     onnx_model_path = layout["int8_onnx"]
+    
+    # 変更点
+    import onnx
+    from onnx import numpy_helper
+    import os
+
+    print("TensorRT互換性のため、モデル構造を安全にOpset 14へ調整しています...")
+    onnx_path = "engines/expert_step.int8.qdq.onnx"
+    base_dir = os.path.dirname(onnx_path) or "."
+    
+    m = onnx.load(onnx_path, load_external_data=False)
+
+    for imp in m.opset_import:
+        if imp.domain == "" or imp.domain == "ai.onnx":
+            imp.version = 14
+
+    target_constant_names = set()
+    for node in m.graph.node:
+        if node.op_type == "ReduceMean" and len(node.input) == 2:
+            target_constant_names.add(node.input[1])
+
+    constants = {}
+    for init in m.graph.initializer:
+        if init.name in target_constant_names:
+            constants[init.name] = numpy_helper.to_array(init, base_dir=base_dir)
+
+    for node in m.graph.node:
+        if node.op_type == "Constant" and node.output[0] in target_constant_names:
+            for attr in node.attribute:
+                if attr.name == "value":
+                    constants[node.output[0]] = numpy_helper.to_array(attr.t, base_dir=base_dir)
+
+    for node in m.graph.node:
+        if node.op_type == "ScatterND":
+            new_attrs = [a for a in node.attribute if a.name != "reduction"]
+            del node.attribute[:]
+            node.attribute.extend(new_attrs)
+            
+        elif node.op_type == "ReduceMean":
+            if len(node.input) == 2:
+                axes_name = node.input[1]
+                if axes_name in constants:
+                    axes_val = constants[axes_name]
+                    axes_attr = onnx.helper.make_attribute("axes", axes_val.flatten().tolist())
+                    node.attribute.append(axes_attr)
+                    node.input.pop()
+                    
+        elif node.op_type == "Reshape":
+            new_attrs = [a for a in node.attribute if a.name != "allowzero"]
+            del node.attribute[:]
+            node.attribute.extend(new_attrs)
+
+    onnx.save(m, onnx_path)
+    # === ここまで追加 ===
+
     trt_engine = TrtExpertEngine(
         onnx_model_path=onnx_model_path,
         engine_cache_dir=layout["engine_cache_dir"],
