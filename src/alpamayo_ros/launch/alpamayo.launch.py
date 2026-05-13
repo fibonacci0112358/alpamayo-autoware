@@ -1,4 +1,6 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -15,6 +17,19 @@ def generate_launch_description() -> LaunchDescription:
     default_camera_indices = [0, 1, 2, 6]
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "model_name_or_path",
+                default_value="nvidia/Alpamayo-1.5-10B",
+            ),
+            DeclareLaunchArgument(
+                "processor_name_or_path",
+                default_value="Qwen/Qwen3-VL-2B-Instruct",
+            ),
+            DeclareLaunchArgument(
+                "vlm_name_or_path",
+                default_value="nvidia/Cosmos-Reason2-8B",
+            ),
+            DeclareLaunchArgument("offline_mode", default_value="false"),
             Node(
                 package="alpamayo_ros",
                 executable="alpamayo_node",
@@ -23,6 +38,12 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     {
+                        "model_name_or_path": LaunchConfiguration("model_name_or_path"),
+                        "vlm_name_or_path": LaunchConfiguration("vlm_name_or_path"),
+                        "processor_name_or_path": LaunchConfiguration(
+                            "processor_name_or_path"
+                        ),
+                        "offline_mode": LaunchConfiguration("offline_mode"),
                         "auto_run": True,
                         "camera_topics": default_camera_topics,
                         "camera_indices": default_camera_indices,

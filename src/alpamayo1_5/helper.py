@@ -190,14 +190,17 @@ def create_vqa_message(
     ]
 
 
-def get_processor(tokenizer: AutoTokenizer) -> AutoProcessor:
+def get_processor(
+    tokenizer: AutoTokenizer,
+    processor_name_or_path: str = BASE_PROCESSOR_NAME,
+) -> AutoProcessor:
     """Get the processor for the Qwen3-VL-2B-Instruct model."""
     processor_kwargs = {
         "min_pixels": MIN_PIXELS,
         "max_pixels": MAX_PIXELS,
     }
 
-    processor = AutoProcessor.from_pretrained(BASE_PROCESSOR_NAME, **processor_kwargs)
+    processor = AutoProcessor.from_pretrained(processor_name_or_path, **processor_kwargs)
     processor.tokenizer = tokenizer
     return processor
 

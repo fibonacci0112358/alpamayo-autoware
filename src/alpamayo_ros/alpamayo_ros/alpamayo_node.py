@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import math
+import json
+import os
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -33,6 +35,7 @@ from std_msgs.msg import ColorRGBA, String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from alpamayo1_5 import helper
+from alpamayo1_5.config import Alpamayo1_5Config
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
 try:
@@ -44,13 +47,19 @@ except ImportError:
     _HAS_LANELET2 = False
 
 
+HF_CACHE_DIR = Path.home() / ".cache" / "alpamayo-autoware" / "hf"
+
+
 class AlpamayoRosNode(Node):
     """ROS 2 node that consumes live topics (images + odometry) to run Alpamayo inference."""
 
     def __init__(self) -> None:
         super().__init__("alpamayo_node")
 
-        self.model_name: str = "nvidia/Alpamayo-1.5-10B"
+        self.declare_parameter("model_name_or_path", "nvidia/Alpamayo-1.5-10B")
+        self.declare_parameter("vlm_name_or_path", "nvidia/Cosmos-Reason2-8B")
+        self.declare_parameter("processor_name_or_path", "Qwen/Qwen3-VL-2B-Instruct")
+        self.declare_parameter("offline_mode", False)
         self.declare_parameter("trajectory_topic", "/alpamayo/predicted_trajectory")
         self.declare_parameter("cot_topic", "/alpamayo/reasoning")
         self.declare_parameter("cot_with_stamped_topic", "/alpamayo/reasoning_stamped")
@@ -85,6 +94,26 @@ class AlpamayoRosNode(Node):
         # ``scripts/build_trt_expert_engine.py`` to swap in a TrtExpertEngine
         # runtime for the 5-step diffusion inner loop.
         self.declare_parameter("expert_onnx_path", "")
+
+        model_name_or_path = str(self.get_parameter("model_name_or_path").value)
+        vlm_name_or_path = str(self.get_parameter("vlm_name_or_path").value)
+        processor_name_or_path = str(self.get_parameter("processor_name_or_path").value)
+        offline_mode = bool(self.get_parameter("offline_mode").value)
+
+        HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+        os.environ["HF_HUB_CACHE"] = str(HF_CACHE_DIR / "hub")
+        os.environ["HF_ASSETS_CACHE"] = str(HF_CACHE_DIR / "assets")
+        os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
+        self.get_logger().info(f"Hugging Face cache directory fixed at {HF_CACHE_DIR}")
+
+        if offline_mode:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+        self.model_name = model_name_or_path
+        self.vlm_name_or_path = vlm_name_or_path
+        self.processor_name_or_path = processor_name_or_path
 
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
@@ -190,10 +219,19 @@ class AlpamayoRosNode(Node):
         self.get_logger().info(
             f"Loading Alpamayo model {self.model_name} on device={self._device} dtype={self._dtype}"
         )
-        self._model = Alpamayo1_5.from_pretrained(self.model_name, dtype=self._dtype).to(
-            self._device
-        )
+        model_config_path = Path(self.model_name) / "config.json"
+        model_config_data = json.loads(model_config_path.read_text())
+        model_config_data["vlm_name_or_path"] = self.vlm_name_or_path
+        model_config = Alpamayo1_5Config(**model_config_data)
+        self._model = Alpamayo1_5.from_pretrained(
+            self.model_name,
+            config=model_config,
+            dtype=self._dtype,
+        ).to(self._device)
         self._model.eval()
+        self._processor = helper.get_processor(self._model.tokenizer, self.processor_name_or_path)
+        self.get_logger().info(f"Using VLM backbone {self.vlm_name_or_path}")
+        self.get_logger().info(f"Using processor {self.processor_name_or_path}")
 
         # Optional TRT FP16 expert engine — swap in if expert_onnx_path set
         # and the file exists. Falls back silently to native PyTorch otherwise.
@@ -230,8 +268,6 @@ class AlpamayoRosNode(Node):
                 f"Generation: NUCLEUS (top_p={self._top_p}, temperature={self._temperature})"
             )
         self._max_gen_len = int(self.get_parameter("max_generation_length").value)
-
-        self._processor = helper.get_processor(self._model.tokenizer)
 
         # Set random seed once during initialization
         seed = 0

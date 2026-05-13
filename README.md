@@ -156,6 +156,28 @@ ros2 launch alpamayo_ros alpamayo.launch.py \
   use_greedy_decode:=true
 ```
 
+### Offline Reuse
+
+If the model and processor have already been downloaded once, you can force offline
+execution by pointing the node at cached local paths or by enabling offline mode:
+
+```bash
+ros2 launch alpamayo_ros alpamayo.launch.py \
+  model_name_or_path:=/path/to/local/Alpamayo-1.5-10B \
+  vlm_name_or_path:=/path/to/local/Cosmos-Reason2-8B \
+  processor_name_or_path:=/path/to/local/Qwen3-VL-2B-Instruct \
+  offline_mode:=true
+```
+
+The local directories must contain the files expected by Hugging Face Transformers.
+If you keep using model IDs instead of paths, offline mode still works as long as the
+same artifacts are already present in the HF cache.
+
+By policy, the node uses a fixed Hugging Face cache location under the current user's
+home directory: `~/.cache/alpamayo-autoware/hf`. The node sets `HF_HOME`,
+`HF_HUB_CACHE`, `HF_ASSETS_CACHE`, and `TRANSFORMERS_CACHE` to that location at
+startup, so repeated runs reuse the same downloaded weights and processor files.
+
 ### Rosbag Replay Evaluation
 
 ```bash
@@ -183,6 +205,10 @@ ros2 bag play <bag_path> --clock --rate 0.5
 | `nav_text_topic` | `/alpamayo/nav_text` | Navigation text topic |
 | `inference_period_sec` | `0.1` | Inference trigger period |
 | `expert_onnx_path` | `""` | TRT expert ONNX path (empty = native PyTorch) |
+| `model_name_or_path` | `nvidia/Alpamayo-1.5-10B` | HF model ID or local directory |
+| `vlm_name_or_path` | `nvidia/Cosmos-Reason2-8B` | Internal VLM ID or local snapshot |
+| `processor_name_or_path` | `Qwen/Qwen3-VL-2B-Instruct` | Processor ID or local directory |
+| `offline_mode` | `false` | Set HF offline env vars before loading |
 | `num_diffusion_steps` | `5` | Diffusion steps (10 = quality, 5 = speed) |
 | `use_greedy_decode` | `true` | Greedy decode (faster, deterministic) |
 | `top_p` | `0.98` | Nucleus sampling threshold |
