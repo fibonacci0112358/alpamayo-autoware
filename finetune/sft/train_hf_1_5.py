@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from collections.abc import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src"
@@ -17,6 +18,7 @@ if str(SRC_ROOT) not in sys.path:
 import hydra
 import hydra.utils as hyu
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import ConcatDataset, Dataset
 from transformers import AutoProcessor, Trainer, TrainingArguments
 
 from alpamayo1_5.config import Alpamayo1_5Config
@@ -48,6 +50,62 @@ def _get(cfg: DictConfig, key: str, default=None):
     return default if value is None else value
 
 
+def _as_path_list(value: str | Path | Sequence[str | Path] | None) -> list[Path] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(item) for item in value]
+
+
+def _build_concat_dataset(datasets: list[Dataset]) -> Dataset:
+    if not datasets:
+        raise ValueError("At least one dataset is required")
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
+
+
+def _resolve_local_dirs(
+    local_dir_root: str | Path | None,
+    local_dir_names: Sequence[str | Path] | None,
+) -> list[Path] | None:
+    if local_dir_names is None:
+        return None
+
+    names = list(local_dir_names)
+    if not names:
+        return None
+
+    if local_dir_root is None:
+        return [Path(item) for item in names]
+
+    root = Path(local_dir_root)
+    return [root / Path(item) for item in names]
+
+
+def _resolve_manifest_paths_from_folders(
+    local_dir_root: str | Path | None,
+    local_dir_names: Sequence[str | Path] | None,
+) -> list[Path] | None:
+    local_dirs = _resolve_local_dirs(local_dir_root, local_dir_names)
+    if not local_dirs:
+        return None
+
+    manifest_paths: list[Path] = []
+    for local_dir in local_dirs:
+        if local_dir.is_file() and local_dir.name == "manifest.json":
+            manifest_paths.append(local_dir)
+            continue
+
+        candidates = sorted(local_dir.glob("**/manifest.json"))
+        if not candidates:
+            raise FileNotFoundError(f"No manifest.json found under {local_dir}")
+        manifest_paths.append(candidates[0])
+
+    return manifest_paths
+
+
 def _build_dataset_from_cfg(
     cfg: DictConfig,
     manifest_path: str | Path | None,
@@ -61,6 +119,62 @@ def _build_dataset_from_cfg(
     file_start,
     file_end,
 ):
+    manifest_paths = _as_path_list(manifest_path)
+    if manifest_paths:
+        datasets: list[Dataset] = []
+        use_pt: bool | None = None
+        for resolved_manifest_path in manifest_paths:
+            records = _read_manifest(resolved_manifest_path)
+            resolved_use_pt = bool(
+                records and isinstance(records[0].get("file"), str) and records[0]["file"].lower().endswith(".pt")
+            )
+            dataset_cls = PtManifestDataset if resolved_use_pt else PaiAvVlmSftDataset
+            dataset = dataset_cls(
+                manifest_path=resolved_manifest_path,
+                image_root=image_root,
+                default_num_frames_per_camera=default_num_frames_per_camera,
+                include_camera_ids=include_camera_ids,
+                include_frame_nums=include_frame_nums,
+                use_nav_prompt=use_nav_prompt,
+                chunk_ids=chunk_ids if chunk_ids is not None else _get(cfg, "data.chunk_ids"),
+                file_start=file_start,
+                file_end=file_end,
+            )
+            datasets.append(dataset)
+            if use_pt is None:
+                use_pt = resolved_use_pt
+            elif use_pt != resolved_use_pt:
+                raise ValueError("Mixed manifest types are not supported in one concatenated dataset")
+        return _build_concat_dataset(datasets), bool(use_pt)
+
+    local_dirs = _as_path_list(local_dir)
+    if local_dirs:
+        datasets: list[Dataset] = []
+        use_pt: bool | None = None
+        for resolved_local_dir in local_dirs:
+            dataset = PaiAvR1VlmSftDataset(
+                local_dir=resolved_local_dir,
+                chunk_ids=chunk_ids if chunk_ids is not None else _get(cfg, "data.chunk_ids"),
+                include_camera_ids=include_camera_ids,
+                include_frame_nums=include_frame_nums,
+                use_nav_prompt=use_nav_prompt,
+                use_default_keyframe=bool(_get(cfg, "data.use_default_keyframe", False)),
+                features_metadata=str(_get(cfg, "data.features_metadata", "features.csv")),
+                clip_index_metadata=str(_get(cfg, "data.clip_index_metadata", "clip_index.parquet")),
+                num_history_steps=int(_get(cfg, "data.num_history_steps", 16)),
+                num_future_steps=int(_get(cfg, "data.num_future_steps", 64)),
+                time_step=float(_get(cfg, "data.time_step", 0.1)),
+                num_frames_per_camera=default_num_frames_per_camera,
+                nav_text=_get(cfg, "data.nav_text"),
+                completion=_get(cfg, "data.completion"),
+                file_start=file_start,
+                file_end=file_end,
+            )
+            datasets.append(dataset)
+            if use_pt is None:
+                use_pt = False
+        return _build_concat_dataset(datasets), bool(use_pt)
+
     if local_dir:
         return PaiAvR1VlmSftDataset(
             local_dir=local_dir,
@@ -170,14 +284,20 @@ def train(cfg: DictConfig) -> None:
 
     manifest_path = _get(cfg, "data.manifest_path")
     local_dir = _get(cfg, "data.local_dir")
+    train_local_dir_names = _get(cfg, "data.train_local_dir_names")
+    valid_local_dir_names = _get(cfg, "data.valid_local_dir_names")
+    local_dir_root = _get(cfg, "data.local_dir_root")
     train_chunk_ids = _get(cfg, "data.train_chunk_ids")
     valid_chunk_ids = _get(cfg, "data.valid_chunk_ids")
     train_file_start = _get(cfg, "data.train_file_start")
     train_file_end = _get(cfg, "data.train_file_end")
     valid_file_start = _get(cfg, "data.valid_file_start")
     valid_file_end = _get(cfg, "data.valid_file_end")
-    if not manifest_path and not local_dir:
-        print("\nNext: provide cfg.data.manifest_path or cfg.data.local_dir to run Stage1 training.")
+    train_manifest_paths = _resolve_manifest_paths_from_folders(local_dir_root, train_local_dir_names)
+    valid_manifest_paths = _resolve_manifest_paths_from_folders(local_dir_root, valid_local_dir_names)
+
+    if not manifest_path and not local_dir and not train_manifest_paths:
+        print("\nNext: provide cfg.data.manifest_path, cfg.data.local_dir, or cfg.data.train_local_dir_names/local_dir_root to run Stage1 training.")
         print("If you want, I can add a small-batch test harness to run forward/backward.")
         return
 
@@ -194,10 +314,11 @@ def train(cfg: DictConfig) -> None:
     )
     processor.tokenizer = model.tokenizer
 
+    dataset_manifest_source = train_manifest_paths if train_manifest_paths is not None else manifest_path
     dataset, use_pt = _build_dataset_from_cfg(
         cfg=cfg,
-        manifest_path=manifest_path,
-        local_dir=local_dir,
+        manifest_path=dataset_manifest_source,
+        local_dir=None if train_manifest_paths is not None else local_dir,
         image_root=image_root,
         default_num_frames_per_camera=default_num_frames_per_camera,
         include_camera_ids=include_camera_ids,
@@ -209,11 +330,12 @@ def train(cfg: DictConfig) -> None:
     )
 
     eval_dataset = None
-    if valid_chunk_ids is not None or valid_file_start is not None or valid_file_end is not None:
+    eval_manifest_source = valid_manifest_paths if valid_manifest_paths is not None else manifest_path
+    if valid_chunk_ids is not None or valid_file_start is not None or valid_file_end is not None or valid_manifest_paths is not None:
         eval_dataset, _ = _build_dataset_from_cfg(
             cfg=cfg,
-            manifest_path=manifest_path,
-            local_dir=local_dir,
+            manifest_path=eval_manifest_source,
+            local_dir=None if valid_manifest_paths is not None else local_dir,
             image_root=image_root,
             default_num_frames_per_camera=default_num_frames_per_camera,
             include_camera_ids=include_camera_ids,
@@ -275,6 +397,7 @@ def train(cfg: DictConfig) -> None:
         save_strategy=save_strategy,
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
+        deepspeed=_get(training_cfg, "deepspeed", None),
     )
 
     if use_lora_flag:

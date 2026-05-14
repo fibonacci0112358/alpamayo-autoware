@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Stage1 Alpamayo1.5 VLM Full Fine-Tuning Config (folder split, H100 8-GPU optimized)
+#
+# Memory-optimized variant for 8×H100 (80GB) setup.
+# Reduced gradient_accumulation_steps to fit memory constraints.
+#
+# Example usage:
+#   torchrun --nproc_per_node=8 finetune/sft/train_hf_1_5.py \
+#     --config-name stage1_vlm_full_folders_h100_8gpu
+
+defaults: []
+
+model:
+  _target_: finetune.sft.models.sft_alpamayo_1_5.TrainableAlpamayo1_5
+  config:
+    vlm_name_or_path: nvidia/Alpamayo-1.5-10B
+    vlm_backend: qwenvl3
+    traj_vocab_size: 768
+    tokens_per_history_traj: 16
+    tokens_per_future_traj: 64
+    model_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    add_special_tokens: false
+  cotrain_vlm: true
+  stop_grad_from_vlm: false
+  stage1_vlm_checkpoint_path: null
+
+lora:
+  use_lora: false
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+
+data:
+  manifest_path: null
+  local_dir: null
+  local_dir_root: /mnt/nvme/alpamayo_data
+  train_local_dir_names: ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010"]
+  valid_local_dir_names: ["009", "010"]
+  image_root: null
+  chunk_ids: null
+  train_chunk_ids: null
+  valid_chunk_ids: null
+  train_file_start: null
+  train_file_end: null
+  valid_file_start: null
+  valid_file_end: null
+  use_default_keyframe: false
+  features_metadata: features.csv
+  clip_index_metadata: clip_index.parquet
+  num_frames_per_camera: 4
+  num_history_steps: 16
+  num_future_steps: 64
+  time_step: 0.1
+  nav_text: null
+  completion: null
+
+training:
+  output_dir: outputs/stage1_vlm_full_folders_h100_8gpu
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  num_train_epochs: 3.0
+  max_steps: -1
+  logging_steps: 10
+  save_strategy: "epoch"
+  save_total_limit: 1
+  eval_strategy: "no"
+  eval_steps: null
+  bf16: true
+  fp16: false
+  dataloader_num_workers: 0
+  report_to: []
+  optim: adamw_torch
+  warmup_ratio: 0.03
+  deepspeed: finetune/sft/configs/deepspeed/zero3_offload.json
