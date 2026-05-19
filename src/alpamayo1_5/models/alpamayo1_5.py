@@ -98,6 +98,12 @@ class Alpamayo1_5(ReasoningVLA):
         if config.expert_cfg is not None:
             for key, value in config.expert_cfg.items():
                 setattr(expert_config, key, value)
+        # flash_attention_2 only accepts None or 2D binary padding masks, but the
+        # expert denoiser always receives a 4D float bias mask from
+        # _build_expert_pos_ids_and_attn_mask. Fall back to sdpa which accepts
+        # attn_mask as a float bias tensor via scaled_dot_product_attention.
+        if getattr(expert_config, "_attn_implementation", None) == "flash_attention_2":
+            expert_config._attn_implementation = "sdpa"
         self.expert = AutoModel.from_config(expert_config)
         # we don't need the embed_tokens of the expert model
         del self.expert.embed_tokens

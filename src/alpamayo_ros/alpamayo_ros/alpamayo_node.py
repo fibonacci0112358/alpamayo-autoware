@@ -48,6 +48,7 @@ except ImportError:
 
 
 HF_CACHE_DIR = Path.home() / ".cache" / "alpamayo-autoware" / "hf"
+DEFAULT_HF_HOME = Path.home() / ".cache" / "huggingface"
 
 
 class AlpamayoRosNode(Node):
@@ -100,12 +101,20 @@ class AlpamayoRosNode(Node):
         processor_name_or_path = str(self.get_parameter("processor_name_or_path").value)
         offline_mode = bool(self.get_parameter("offline_mode").value)
 
-        HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        os.environ["HF_HOME"] = str(HF_CACHE_DIR)
-        os.environ["HF_HUB_CACHE"] = str(HF_CACHE_DIR / "hub")
-        os.environ["HF_ASSETS_CACHE"] = str(HF_CACHE_DIR / "assets")
-        os.environ["TRANSFORMERS_CACHE"] = str(HF_CACHE_DIR / "transformers")
-        self.get_logger().info(f"Hugging Face cache directory fixed at {HF_CACHE_DIR}")
+        # Prefer the user's existing HuggingFace cache if present so
+        # local snapshots under ~/.cache/huggingface are reused. Fall
+        # back to the dedicated project cache otherwise.
+        if (DEFAULT_HF_HOME.exists() and (DEFAULT_HF_HOME / "hub").exists()):
+            chosen_hf_home = DEFAULT_HF_HOME
+        else:
+            HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            chosen_hf_home = HF_CACHE_DIR
+
+        os.environ["HF_HOME"] = str(chosen_hf_home)
+        os.environ["HF_HUB_CACHE"] = str(Path(os.environ["HF_HOME"]) / "hub")
+        os.environ["HF_ASSETS_CACHE"] = str(Path(os.environ["HF_HOME"]) / "assets")
+        os.environ["TRANSFORMERS_CACHE"] = str(Path(os.environ["HF_HOME"]) / "transformers")
+        self.get_logger().info(f"Hugging Face cache directory fixed at {os.environ['HF_HOME']}")
 
         if offline_mode:
             os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -226,7 +235,7 @@ class AlpamayoRosNode(Node):
         self._model = Alpamayo1_5.from_pretrained(
             self.model_name,
             config=model_config,
-            dtype=self._dtype,
+            torch_dtype=self._dtype,
         ).to(self._device)
         self._model.eval()
         self._processor = helper.get_processor(self._model.tokenizer, self.processor_name_or_path)
@@ -414,11 +423,11 @@ class AlpamayoRosNode(Node):
             frames = list(self._camera_buffers[topic])[-self._num_frames :]
             jpeg_buffers.extend([f for _, f in frames])
 
-        decoded = [torchvision.io.decode_jpeg(buf, device="cuda") for buf in jpeg_buffers]
+        decoded = [torchvision.io.decode_jpeg(buf, device="cuda", mode="RGB") for buf in jpeg_buffers]
         stacked = torch.stack(decoded)  # [N_total, 3, H, W] uint8 on GPU
-        if stacked.shape[-2:] != (560, 1008):
+        if stacked.shape[-2:] != (308, 588):
             stacked = torch.nn.functional.interpolate(
-                stacked.float(), size=(560, 1008), mode="bicubic", align_corners=False,
+                stacked.float(), size=(308, 588), mode="bicubic", align_corners=False,
             ).clamp(0, 255).to(torch.uint8)
 
         n_cams = len(self._camera_topics)
@@ -469,6 +478,12 @@ class AlpamayoRosNode(Node):
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
         frames = payload["image_frames"]  # already on GPU (uint8) from GPU preproc
+        self.get_logger().info(
+            "Inference payload: "
+            f"frames.shape={tuple(frames.shape)} "
+            f"camera_indices.shape={tuple(payload['camera_indices'].shape)} "
+            f"nav_text={payload.get('nav_text')}"
+        )
         messages = helper.create_message(
             frames.flatten(0, 1),
             camera_indices=payload["camera_indices"],
@@ -487,6 +502,13 @@ class AlpamayoRosNode(Node):
             return_tensors="pt",
             device="cuda",
         )
+        for key, value in processor_inputs.items():
+            if hasattr(value, "shape"):
+                self.get_logger().info(
+                    f"Processor output: {key}.shape={tuple(value.shape)} dtype={value.dtype}"
+                )
+            else:
+                self.get_logger().info(f"Processor output: {key}={type(value).__name__}")
         # apply_chat_template(device=cuda) only puts pixel_values on GPU;
         # text ids / attention_mask / image_grid_thw still come back on CPU.
         # Move them to GPU once here so the model forward doesn't hit per-
@@ -656,7 +678,11 @@ class AlpamayoRosNode(Node):
         try:
             metrics = future.result()
         except Exception as exc:
-            self.get_logger().error(f"Alpamayo inference failed: {exc}")
+            import traceback
+
+            tb = traceback.format_exc()
+            # Log both the exception message and full traceback for debugging
+            self.get_logger().error(f"Alpamayo inference failed: {exc} \n{tb}")
             return
         if not metrics:
             return

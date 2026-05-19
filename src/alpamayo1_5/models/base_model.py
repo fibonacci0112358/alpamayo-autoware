@@ -23,6 +23,8 @@ import einops
 import hydra.utils as hyu
 import numpy as np
 import torch
+import os
+from pathlib import Path
 from transformers import (
     AutoProcessor,
     PretrainedConfig,
@@ -260,7 +262,21 @@ class ReasoningVLAConfig(PretrainedConfig):
         if self.max_pixels is not None:
             processor_kwargs["max_pixels"] = self.max_pixels
 
-        processor = AutoProcessor.from_pretrained(self.vlm_name_or_path, **processor_kwargs)
+        # If the vlm_name_or_path is a local directory or we're in HF offline
+        # mode, prefer local files only to avoid network requests.
+        local_only = False
+        try:
+            from os import environ
+
+            local_only = Path(self.vlm_name_or_path).exists() or environ.get(
+                "HF_HUB_OFFLINE", "0"
+            ).lower() in ("1", "true")
+        except Exception:
+            local_only = False
+
+        processor = AutoProcessor.from_pretrained(
+            self.vlm_name_or_path, local_files_only=local_only, **processor_kwargs
+        )
         tokenizer = processor.tokenizer
 
         # Add traj tokens to the tokenizer
@@ -336,7 +352,19 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         if config.max_pixels is not None:
             processor_kwargs["max_pixels"] = config.max_pixels
 
-        processor = AutoProcessor.from_pretrained(config.vlm_name_or_path, **processor_kwargs)
+        local_only = False
+        try:
+            from os import environ
+
+            local_only = Path(config.vlm_name_or_path).exists() or environ.get(
+                "HF_HUB_OFFLINE", "0"
+            ).lower() in ("1", "true")
+        except Exception:
+            local_only = False
+
+        processor = AutoProcessor.from_pretrained(
+            config.vlm_name_or_path, local_files_only=local_only, **processor_kwargs
+        )
         tokenizer = processor.tokenizer
 
         if config.traj_vocab_size is not None:
@@ -374,10 +402,14 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         Qwen3-VL uses Qwen3VLForConditionalGeneration from transformers.
         See: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct
         """
+        local_only = Path(config.vlm_name_or_path).exists() or os.environ.get(
+            "HF_HUB_OFFLINE", "0"
+        ).lower() in ("1", "true")
         vlm_config = Qwen3VLConfig.from_pretrained(
             config.vlm_name_or_path,
             dtype=config.model_dtype,
             attn_implementation=config.attn_implementation,
+            local_files_only=local_only,
         )
         self.original_vocab_size = vlm_config.text_config.vocab_size
         vlm_config.text_config.vocab_size = config.vocab_size
@@ -417,6 +449,7 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
             config.vlm_name_or_path,
             dtype=config.model_dtype,
             attn_implementation=config.attn_implementation,
+            local_files_only=local_only,
         )
 
         original_vocab_size = vlm.config.text_config.vocab_size
