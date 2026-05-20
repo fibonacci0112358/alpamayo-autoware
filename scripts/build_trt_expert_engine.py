@@ -65,7 +65,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a split TensorRT engine for Alpamayo's expert denoiser."
     )
-    parser.add_argument("--model-id", default="nvidia/Alpamayo-1.5-10B")
+    parser.add_argument(
+        "--model-name-or-path",
+        default=None,
+        help="Hugging Face model ID or local model directory path.",
+    )
+    parser.add_argument(
+        "--model-id",
+        default="nvidia/Alpamayo-1.5-10B",
+        help="Deprecated alias for --model-name-or-path.",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--clip-id", default=DEFAULT_CLIP_ID)
     parser.add_argument("--t0-us", type=int, default=DEFAULT_T0_US)
@@ -89,6 +98,12 @@ def calibration_method_from_name(name: str) -> CalibrationMethod:
         "minmax": CalibrationMethod.MinMax,
     }
     return mapping[name]
+
+
+def resolve_model_name_or_path(args: argparse.Namespace) -> str:
+    if args.model_name_or_path:
+        return args.model_name_or_path
+    return args.model_id
 
 
 def prepare_model_inputs(model: Alpamayo1_5, clip_id: str, t0_us: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -135,9 +150,10 @@ def run_full_inference(
 
 def main() -> None:
     args = parse_args()
+    model_name_or_path = resolve_model_name_or_path(args)
     layout = initialize_artifact_layout(args.output_dir)
 
-    model = Alpamayo1_5.from_pretrained(args.model_id, dtype=torch.bfloat16).to("cuda")
+    model = Alpamayo1_5.from_pretrained(model_name_or_path, dtype=torch.bfloat16).to("cuda")
     model.eval()
     model_inputs, _ = prepare_model_inputs(model, args.clip_id, args.t0_us)
 
@@ -243,7 +259,7 @@ def main() -> None:
     )
 
     manifest = {
-        "model_id": args.model_id,
+        "model_name_or_path": model_name_or_path,
         "clip_id": args.clip_id,
         "t0_us": args.t0_us,
         "seed": args.seed,
@@ -258,7 +274,7 @@ def main() -> None:
     if not args.skip_validation:
         del model
         torch.cuda.empty_cache()
-        model = Alpamayo1_5.from_pretrained(args.model_id, dtype=torch.bfloat16).to("cuda")
+        model = Alpamayo1_5.from_pretrained(model_name_or_path, dtype=torch.bfloat16).to("cuda")
         model.eval()
         model_inputs, _ = prepare_model_inputs(model, args.clip_id, args.t0_us)
 
