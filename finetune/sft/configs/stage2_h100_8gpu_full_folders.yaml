@@ -29,7 +29,7 @@ model:
       _target_: alpamayo1_5.models.action_in_proj.PerWaypointActionInProjV2
     action_out_proj_cfg:
       _target_: torch.nn.Linear
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   cotrain_vlm: false
   stop_grad_from_vlm: true
   stage1_vlm_checkpoint_path: null

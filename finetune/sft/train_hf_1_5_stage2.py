@@ -16,8 +16,11 @@ if str(SRC_ROOT) not in sys.path:
 import hydra
 import hydra.utils as hyu
 from omegaconf import DictConfig, OmegaConf
-from transformers import AutoProcessor, Trainer, TrainingArguments
+from transformers import AutoProcessor, Trainer, TrainingArguments, TrainerCallback
 from torch.utils.data import ConcatDataset, Dataset
+import time
+import os
+import torch
 
 from alpamayo1_5.config import Alpamayo1_5Config
 from alpamayo1_5.helper import BASE_PROCESSOR_NAME
@@ -31,6 +34,30 @@ from finetune.sft.data.pt_manifest_dataset import PtManifestDataset, _read_manif
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class AverageLossCallback(TrainerCallback):
+    """Normalize logged 'loss' by gradient accumulation steps and world size.
+
+    This ensures Trainer's reported loss is closer to per-microbatch average.
+    """
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or 'loss' not in logs:
+            return
+        try:
+            grad_acc = int(getattr(args, 'gradient_accumulation_steps', 1) or 1)
+        except Exception:
+            grad_acc = 1
+        try:
+            world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        except Exception:
+            world_size = 1
+        denom = max(1, grad_acc * world_size)
+        try:
+            logs['loss'] = float(logs['loss']) / denom
+        except Exception:
+            pass
 
 
 def _get(cfg: DictConfig, key: str, default=None):
@@ -269,7 +296,7 @@ def _resolve_stage1_checkpoint_path(path: str) -> str:
 
 @hydra.main(version_base=None, config_path="configs", config_name="stage2")
 def train(cfg: DictConfig) -> None:
-    logger.debug("Resolved config:\n%s", OmegaConf.to_yaml(cfg))
+    logger.info("Resolved config:\n%s", OmegaConf.to_yaml(cfg))
     logger.info("Stage2 entrypoint started")
 
 
@@ -316,7 +343,7 @@ def train(cfg: DictConfig) -> None:
         try:
             if hasattr(model, "gradient_checkpointing_enable"):
                 model.gradient_checkpointing_enable()
-                logger.debug("Gradient checkpointing enabled")
+                logger.info("Gradient checkpointing enabled")
             else:
                 logger.warning("Model does not support gradient checkpointing")
         except Exception as e:
@@ -417,8 +444,41 @@ def train(cfg: DictConfig) -> None:
     eval_steps_val = _get(training_cfg, "eval_steps")
     eval_steps = int(eval_steps_val) if eval_steps_val is not None else None
 
+    # Add timestamp to output_dir and synchronize across distributed ranks
+    output_dir_base = str(_get(training_cfg, "output_dir", "outputs/stage2"))
+    run_timestamp = None
+    try:
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            import torch.distributed as dist
+
+            if not dist.is_available():
+                raise RuntimeError("torch.distributed not available")
+            if not dist.is_initialized():
+                dist.init_process_group(
+                    backend="nccl" if torch.cuda.is_available() else "gloo",
+                    init_method="env://",
+                )
+
+            if rank == 0:
+                ts_int = int(time.time())
+                ts_tensor = torch.tensor([ts_int], dtype=torch.long)
+            else:
+                ts_tensor = torch.tensor([0], dtype=torch.long)
+
+            dist.broadcast(ts_tensor, src=0)
+            run_timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(int(ts_tensor.item())))
+        else:
+            run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    output_dir_with_timestamp = f"{output_dir_base}_{run_timestamp}"
+    logger.info(f"Output directory with timestamp: {output_dir_with_timestamp}")
+
     training_args = TrainingArguments(
-        output_dir=str(_get(training_cfg, "output_dir", "outputs/stage2")),
+        output_dir=output_dir_with_timestamp,
         per_device_train_batch_size=int(_get(training_cfg, "per_device_train_batch_size", 1)),
         gradient_accumulation_steps=int(_get(training_cfg, "gradient_accumulation_steps", 1)),
         learning_rate=float(_get(training_cfg, "learning_rate", 1e-5)),
@@ -440,6 +500,7 @@ def train(cfg: DictConfig) -> None:
         deepspeed=_get(training_cfg, "deepspeed", None),
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
+        disable_tqdm=False,
     )
 
     trainer_kwargs = dict(
@@ -450,6 +511,10 @@ def train(cfg: DictConfig) -> None:
     )
     if eval_dataset is not None:
         trainer_kwargs['eval_dataset'] = eval_dataset
+
+    # Attach AverageLossCallback so reported loss is averaged (not summed)
+    callbacks = [AverageLossCallback()]
+    trainer_kwargs["callbacks"] = callbacks
 
     trainer = Trainer(**trainer_kwargs)
 

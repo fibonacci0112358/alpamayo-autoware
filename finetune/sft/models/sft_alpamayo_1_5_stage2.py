@@ -55,7 +55,6 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
             total = sum(p.numel() for p in self.parameters())
             trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
             logger.info("Stage2 init: total_params=%d trainable_params=%d", total, trainable)
-            print(f"Stage2 init: total_params={total} trainable_params={trainable}")
         except Exception:
             pass
 
@@ -165,13 +164,17 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
 
         vlm_outputs = None
         context = nullcontext() if self.cotrain_vlm else torch.no_grad()
-        with context:
-            vlm_outputs = self.vlm(
-                input_ids=input_ids,
-                labels=vlm_labels,
-                use_cache=True,
-                **vlm_kwargs,
-            )
+        try:
+            with context:
+                vlm_outputs = self.vlm(
+                    input_ids=input_ids,
+                    labels=vlm_labels,
+                    use_cache=True,
+                    **vlm_kwargs,
+                )
+        except Exception as e:
+            logger.warning("Stage2 forward: VLM forward failed: %s", e)
+            vlm_outputs = None
 
         if ego_future_xyz is None or ego_future_rot is None:
             return {"loss": zero_loss()}
@@ -208,22 +211,26 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
         # 5. Get and process KV cache
         try:
             kv_cache = None
-            if vlm_outputs is not None:
-                kv_cache = getattr(vlm_outputs, "past_key_values", None)
+            if vlm_outputs is not None and hasattr(vlm_outputs, "past_key_values"):
+                kv_cache = vlm_outputs.past_key_values
+            elif vlm_outputs is None:
+                logger.warning("Stage2 forward: vlm_outputs is None, cannot get kv_cache")
         except Exception as e:
             logger.warning("Stage2 forward: accessing past_key_values failed: %s", e)
+            import traceback
+            logger.warning("Traceback: %s", traceback.format_exc())
             kv_cache = None
 
         # 6. Attempt to crop KV cache
         try:
-            if hasattr(self, "config") and hasattr(self.config, "traj_token_ids"):
-                future_start_token_id = self.config.traj_token_ids.get("future_start")
-                if future_start_token_id is not None:
-                    future_positions = (input_ids == future_start_token_id).nonzero(as_tuple=False)
-                    if future_positions.numel() > 0:
-                        last_traj_future_start_idx = future_positions[-1, 1] + 1
-                        if hasattr(kv_cache, "crop"):
-                            kv_cache.crop(last_traj_future_start_idx)
+                if kv_cache is not None and hasattr(self, "config") and hasattr(self.config, "traj_token_ids"):
+                    future_start_token_id = self.config.traj_token_ids.get("future_start")
+                    if future_start_token_id is not None:
+                        future_positions = (input_ids == future_start_token_id).nonzero(as_tuple=False)
+                        if future_positions.numel() > 0:
+                            last_traj_future_start_idx = future_positions[-1, 1] + 1
+                            if hasattr(kv_cache, "crop"):
+                                kv_cache.crop(last_traj_future_start_idx)
         except Exception as e:
             logger.warning("Stage2 forward: kv_cache crop failed: %s", e)
 
@@ -252,6 +259,8 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
 
         # 8. Run expert forward
         pred = None
+        expert_forward_success = False
+        
         if kv_cache is not None:
             try:
                 forward_kwargs = {}
@@ -268,11 +277,15 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
                 diffusion_out = expert_outputs.last_hidden_state[:, -expert_embeds.shape[1] :]
                 pred = self.action_out_proj(diffusion_out)
                 pred = pred.view(-1, *self.action_space.get_action_space_dims())
+                expert_forward_success = True
             except Exception as e:
                 logger.warning("Stage2 forward: expert forward failed: %s", e)
                 pred = None
+        else:
+            logger.warning("Stage2 forward: kv_cache is None - VLM forward may have failed or traj_tokens processing issue")
         
         if pred is None:
+            logger.warning("Stage2 forward: using fallback prediction (expert bypassed)")
             try:
                 pred = self.action_out_proj(expert_embeds)
                 pred = pred.view(-1, *self.action_space.get_action_space_dims())
@@ -281,6 +294,9 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
                 return {"loss": zero_loss()}
 
         # 9. Compute diffusion loss
+        logger.info("Stage2 forward: Entering loss computation. Expert forward path used: %s, pred shape: %s",
+                   expert_forward_success, pred.shape if pred is not None else "None")
+        
         try:
             future_traj_loss = self.diffusion.compute_loss_from_pred(training_data=training_data, pred=pred)
 
@@ -290,7 +306,11 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
                 try:
                     loss = loss + vlm_outputs.loss
                 except Exception as e:
+                    logger.warning("Stage2 forward: vlm loss failed: %s", e)    
                     pass
+            logger.info("Stage2 forward: Loss computed successfully. action_loss: %.6f, total_loss: %.6f",
+                       future_traj_loss.item() if hasattr(future_traj_loss, "item") else future_traj_loss,
+                       loss.item() if hasattr(loss, "item") else loss)
         except Exception as e:
             logger.warning("Stage2 forward: diffusion loss failed: %s", e)
             return {"loss": zero_loss()}

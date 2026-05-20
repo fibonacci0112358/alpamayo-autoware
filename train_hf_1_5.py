@@ -140,30 +140,6 @@ class StepTimingCallback(TrainerCallback):
         logger.info("[LOSS] step=%s loss=%.8f logs=%s", state.global_step, loss_value, {k: logs[k] for k in logs if k in {"loss", "learning_rate", "grad_norm", "epoch"}})
 
 
-class AverageLossCallback(TrainerCallback):
-    """Normalize logged 'loss' by gradient accumulation steps and world size.
-
-    This ensures Trainer's reported loss is closer to per-microbatch average.
-    """
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if not logs or 'loss' not in logs:
-            return
-        try:
-            grad_acc = int(getattr(args, 'gradient_accumulation_steps', 1) or 1)
-        except Exception:
-            grad_acc = 1
-        try:
-            world_size = int(os.environ.get('WORLD_SIZE', '1'))
-        except Exception:
-            world_size = 1
-        denom = max(1, grad_acc * world_size)
-        try:
-            logs['loss'] = float(logs['loss']) / denom
-        except Exception:
-            pass
-
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -658,7 +634,7 @@ def train(cfg: DictConfig) -> None:
     elif eval_dataset is not None and eval_strategy == "no":
         logger.warning("Evaluation dataset is available but eval_strategy=no; skipping evaluation (eval_dataset_size=%d)", len(eval_dataset))
 
-    callbacks = [StepTimingCallback(), AverageLossCallback()]
+    callbacks = [StepTimingCallback()]
     early_stopping_patience = _get(training_cfg, "early_stopping_patience", None)
     if early_stopping_patience is not None and int(early_stopping_patience) > 0:
         if eval_strategy == "no" or eval_dataset is None:
