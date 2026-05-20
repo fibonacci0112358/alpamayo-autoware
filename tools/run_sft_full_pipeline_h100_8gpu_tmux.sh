@@ -16,6 +16,9 @@ DEEPSPEED_CONFIG="finetune/sft/configs/deepspeed/zero2.json"
 STAGE2_CONFIG_NAME="stage2_h100_8gpu_full_folders"
 
 mkdir -p "$LOG_DIR" "$STAGE1_OUTPUT_DIR" "$STAGE2_OUTPUT_DIR"
+STAGE1_RUN_DIR="${STAGE1_OUTPUT_DIR}_$RUN_TS"
+STAGE2_RUN_DIR="${STAGE2_OUTPUT_DIR}_$RUN_TS"
+mkdir -p "$STAGE1_RUN_DIR" "$STAGE2_RUN_DIR"
 
 timestamp_line() {
   awk '{ print $0, strftime("[%Y-%m-%dT%H:%M:%S%z]"); fflush(); }'
@@ -135,7 +138,7 @@ MASTER_PORT="\${MASTER_PORT:-$((20000 + (RANDOM % 20000)))}"
 log_main "[pipeline] Using master port: \$MASTER_PORT"
 
 log_main "[pipeline] Stage1 training starting"
-run_logged_command "$STAGE1_LOG_FILE" stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5.py --config-name=stage1_vlm_full_folders_h100_8gpu hydra.run.dir="$STAGE1_OUTPUT_DIR" training.output_dir="$STAGE1_OUTPUT_DIR" training.deepspeed="$DEEPSPEED_CONFIG"
+run_logged_command "$STAGE1_LOG_FILE" stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5.py --config-name=stage1_vlm_full_folders_h100_8gpu hydra.run.dir="$STAGE1_RUN_DIR" training.output_dir="$STAGE1_RUN_DIR" training.deepspeed="$DEEPSPEED_CONFIG"
 stage1_exit_code=\$?
 log_main "[pipeline] Stage1 exit_code=\$stage1_exit_code"
 
@@ -144,15 +147,17 @@ if [[ \$stage1_exit_code -ne 0 ]]; then
   exit "\$stage1_exit_code"
 fi
 
-STAGE1_MODEL_PATH="\$(find_stage_model_dir "$STAGE1_OUTPUT_DIR")"
+STAGE1_MODEL_PATH="\$(find_stage_model_dir "$STAGE1_RUN_DIR")"
 if [[ -z "\${STAGE1_MODEL_PATH:-}" ]]; then
-  log_main "[pipeline] ERROR: could not find Stage1 model directory under $STAGE1_OUTPUT_DIR"
+  log_main "[pipeline] ERROR: could not find Stage1 model directory under $STAGE1_RUN_DIR"
   exit 1
 fi
 
 log_main "[pipeline] Stage1 model directory: \$STAGE1_MODEL_PATH"
+log_main "[pipeline] Creating/updating symlink: $STAGE1_OUTPUT_DIR -> $STAGE1_RUN_DIR"
+ln -sfn "$STAGE1_RUN_DIR" "$STAGE1_OUTPUT_DIR"
 log_main "[pipeline] Stage2 training starting"
-run_logged_command "$STAGE2_LOG_FILE" stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5_stage2.py --config-name="$STAGE2_CONFIG_NAME" hydra.run.dir="$STAGE2_OUTPUT_DIR" training.output_dir="$STAGE2_OUTPUT_DIR" model.config.vlm_name_or_path="\$STAGE1_MODEL_PATH"
+run_logged_command "$STAGE2_LOG_FILE" stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5_stage2.py --config-name="$STAGE2_CONFIG_NAME" hydra.run.dir="$STAGE2_RUN_DIR" training.output_dir="$STAGE2_RUN_DIR" model.config.vlm_name_or_path="\$STAGE1_MODEL_PATH"
 stage2_exit_code=\$?
 log_main "[pipeline] Stage2 exit_code=\$stage2_exit_code"
 
@@ -160,6 +165,9 @@ if [[ \$stage2_exit_code -ne 0 ]]; then
   log_main "[pipeline] ERROR: Stage2 failed"
   exit "\$stage2_exit_code"
 fi
+
+log_main "[pipeline] Creating/updating symlink: $STAGE2_OUTPUT_DIR -> $STAGE2_RUN_DIR"
+ln -sfn "$STAGE2_RUN_DIR" "$STAGE2_OUTPUT_DIR"
 
 log_main "[pipeline] Finished successfully at \$(date)"
 EOF

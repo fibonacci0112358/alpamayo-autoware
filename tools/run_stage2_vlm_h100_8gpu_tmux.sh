@@ -5,13 +5,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_SESSION_NAME="alpamayo-stage2-vlm-h100-8gpu"
 SESSION_NAME="${1:-$DEFAULT_SESSION_NAME}"
-OUTPUT_DIR="${2:-$REPO_ROOT/outputs/stage2_h100_8gpu_v1}"
+OUTPUT_BASE="${2:-$REPO_ROOT/outputs/stage2_h100_8gpu_v1}"
 LOG_DIR="$REPO_ROOT/logs"
-RUN_TS="$(date +%Y%m%d_%H%M%S)"
+# optional third arg: run timestamp to group multi-process outputs under same run
+RUN_TS="${3:-$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_BASE}_$RUN_TS"
 LOG_FILE="$LOG_DIR/${SESSION_NAME}_${RUN_TS}.log"
 export LOG_FILE
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required but was not found in PATH."
@@ -56,7 +58,7 @@ echo "[train] using master port: \$MASTER_PORT" | timestamp_line | tee -a "$LOG_
 
 echo "[train] Stage1 checkpoint path: /mnt/nvme/alpamayo_outputs/stage1_vlm_full_folders_h100_8gpu" | timestamp_line | tee -a "$LOG_FILE"
 
-stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5_stage2.py --config-name=stage2_h100_8gpu_full_folders hydra.run.dir="$OUTPUT_DIR" 2>&1 | timestamp_line | tee -a "\$LOG_FILE"
+stdbuf -oL -eL torchrun --master_port="\$MASTER_PORT" --nproc_per_node=8 finetune/sft/train_hf_1_5_stage2.py --config-name=stage2_h100_8gpu_full_folders hydra.run.dir="$OUTPUT_DIR" training.output_dir="$OUTPUT_DIR" 2>&1 | timestamp_line | tee -a "\$LOG_FILE"
 exit_code=\${PIPESTATUS[0]}
 echo "[train] exit_code=\$exit_code" | timestamp_line | tee -a "$LOG_FILE"
 echo "[train] finished" | timestamp_line | tee -a "$LOG_FILE"
@@ -66,6 +68,9 @@ EOF
 
 tmux new-session -d -s "$SESSION_NAME" -c "$REPO_ROOT" bash -lc "$INNER_COMMAND"
 
+ln -sfn "$OUTPUT_DIR" "$OUTPUT_BASE"
+
 echo "Started tmux session: $SESSION_NAME"
 echo "Log file: $LOG_FILE"
+echo "Output dir: $OUTPUT_DIR (symlink: $OUTPUT_BASE -> $OUTPUT_DIR)"
 echo "Attach with: tmux attach -t $SESSION_NAME"
