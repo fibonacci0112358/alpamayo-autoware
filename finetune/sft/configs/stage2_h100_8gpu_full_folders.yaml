@@ -1,31 +1,37 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# Stage1 Alpamayo1.5 VLM Full Fine-Tuning Config (folder split, H100 8-GPU optimized)
+# Stage2 Alpamayo1.5 SFT config for H100 8GPU with Stage1 pretrained weights (full data, folder split)
 #
-# Memory-optimized variant for 8×H100 (80GB) setup.
-# Reduced gradient_accumulation_steps to fit memory constraints.
-#
-# Example usage:
-#   torchrun --nproc_per_node=8 finetune/sft/train_hf_1_5.py \
-#     --config-name stage1_vlm_full_folders_h100_8gpu
+# Uses same training data as Stage1 (folders 001-012, 015-016 for train; 013-014 for valid)
+# Freezes VLM backbone, trains trajectory modules only
 
 defaults: []
 
 model:
-  _target_: finetune.sft.models.sft_alpamayo_1_5.TrainableAlpamayo1_5
+  _target_: finetune.sft.models.sft_alpamayo_1_5_stage2.TrainableAlpamayo1_5_Stage2
   config:
-    vlm_name_or_path: nvidia/Alpamayo-1.5-10B
+    # Load from stage1 checkpoint as VLM backbone
+    vlm_name_or_path: /mnt/nvme/alpamayo_outputs/stage1_vlm_full_folders_h100_8gpu
     vlm_backend: qwenvl3
     traj_vocab_size: 768
     tokens_per_history_traj: 16
     tokens_per_future_traj: 64
+    vocab_size: 155697
     model_dtype: bfloat16
     attn_implementation: flash_attention_2
     add_special_tokens: false
+    # Action space configuration (from stage1)
+    action_space_cfg:
+      _target_: alpamayo1_5.action_space.unicycle_accel_curvature.UnicycleAccelCurvatureActionSpace
+    # Diffusion configuration (from stage1)
+    diffusion_cfg:
+      _target_: alpamayo1_5.diffusion.flow_matching.FlowMatching
+    # Action projection modules
+    action_in_proj_cfg:
+      _target_: alpamayo1_5.models.action_in_proj.PerWaypointActionInProjV2
+    action_out_proj_cfg:
+      _target_: torch.nn.Linear
   gradient_checkpointing: true
-  cotrain_vlm: true
-  stop_grad_from_vlm: false
+  cotrain_vlm: false
+  stop_grad_from_vlm: true
   stage1_vlm_checkpoint_path: null
 
 lora:
@@ -36,6 +42,7 @@ lora:
 
 data:
   manifest_path: null
+  # Use folder-based data loading like Stage1 (same data split as Stage1)
   local_dir: null
   local_dir_root: /mnt/nvme/alpamayo_data
   train_local_dir_names: ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "015", "016"]
@@ -59,7 +66,7 @@ data:
   completion: null
 
 training:
-  output_dir: /mnt/nvme/alpamayo_outputs/stage1_vlm_full_folders_h100_8gpu
+  output_dir: /mnt/nvme/alpamayo_outputs/stage2_h100_8gpu_full_folders
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 1
   learning_rate: 1.0e-5
@@ -67,7 +74,7 @@ training:
   max_steps: -1
   logging_steps: 10
   save_strategy: "epoch"
-  save_total_limit: 1
+  save_total_limit: 3
   eval_strategy: "no"
   eval_steps: null
   early_stopping_patience: null

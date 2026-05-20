@@ -622,18 +622,35 @@ class PaiAvVlmSftCollator:
     def __call__(self, samples: list[dict[str, Any]]) -> dict[str, Any]:
         text_inputs: list[str] = []
         image_inputs: list[Any] = []
+        prompt_token_lengths: list[int] = []
         batch_extra: dict[str, list[torch.Tensor]] = {}
 
         for sample in samples:
             messages = self._build_messages(sample)
-            text_inputs.append(
-                self.processor.tokenizer.apply_chat_template(
-                    messages,
+            
+            # Compute prompt-only text (system + user) to determine where to mask
+            # Split messages into prompt (system + user) and assistant
+            prompt_messages = [m for m in messages if m.get("role") != "assistant"]
+            if prompt_messages and messages and messages[-1].get("role") == "assistant":
+                # Assistant message exists; we'll compute its start position
+                prompt_text = self.processor.tokenizer.apply_chat_template(
+                    prompt_messages,
                     tokenize=False,
                     add_generation_prompt=False,
-                    continue_final_message=True,
+                    continue_final_message=False,
                 )
+                prompt_token_lengths.append(len(self.processor.tokenizer(prompt_text, add_special_tokens=True)["input_ids"]))
+            else:
+                # No assistant message or malformed; default to full length (no masking)
+                prompt_token_lengths.append(-1)
+
+            full_text = self.processor.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
             )
+            text_inputs.append(full_text)
             image_inputs.append(sample["frames"])
 
             for key, value in sample.items():
@@ -684,17 +701,34 @@ class PaiAvVlmSftCollator:
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
         labels = input_ids.clone()
-        if attention_mask is not None:
-            labels = labels.masked_fill(attention_mask == 0, -100)
-        else:
-            labels = labels.masked_fill(input_ids == self.processor.tokenizer.pad_token_id, -100)
-        batch["labels"] = labels
+        
+        # Create labels_mask: True for positions that should be included in loss calculation
+        batch_size, seq_len = input_ids.shape
+        labels_mask = torch.ones((batch_size, seq_len), dtype=torch.bool)
+        
+        # Mask prompt tokens and padding
+        for i, prompt_len in enumerate(prompt_token_lengths):
+            if attention_mask is not None:
+                labels[i] = labels[i].masked_fill(attention_mask[i] == 0, -100)
+                labels_mask[i] = attention_mask[i].bool()
+            else:
+                labels[i] = labels[i].masked_fill(input_ids[i] == self.processor.tokenizer.pad_token_id, -100)
+                labels_mask[i] = input_ids[i] != self.processor.tokenizer.pad_token_id
+            
+            # Additionally mask prompt tokens (before assistant message)
+            if prompt_len > 0:
+                labels[i, :prompt_len] = -100
+                labels_mask[i, :prompt_len] = False
 
+        # Preserve auxiliary tensors needed by Stage2 model forward.
         for key, values in batch_extra.items():
             if len(values) != len(samples):
                 continue
             first = values[0]
             if all(isinstance(value, torch.Tensor) and value.shape == first.shape for value in values):
                 batch[key] = torch.stack(values, dim=0)
+        
+        batch["labels"] = labels
+        batch["labels_mask"] = labels_mask
 
         return batch

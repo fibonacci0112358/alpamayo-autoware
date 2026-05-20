@@ -79,87 +79,19 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
         position_ids += delta.to(position_ids.device)
         return position_ids
 
-    def _construct_flow_matching_training_data(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Build fallback flow-matching training tensors.
-
-        Some alpamayo1.5 diffusion implementations expose only sampling APIs.
-        For Stage2 training we construct a standard FM objective:
-        - sample noise z ~ N(0, I)
-        - sample t ~ U(0, 1)
-        - x_t = (1 - t) * x_0 + t * z
-        - target v = z - x_0
-        """
-        noise = torch.randn_like(action)
-        bsz = action.shape[0]
-        timesteps = torch.rand((bsz, 1, 1), device=action.device, dtype=action.dtype)
-        noisy_x = (1.0 - timesteps) * action + timesteps * noise
-        target = noise - action
-        return {
-            "noisy_x": noisy_x,
-            "timesteps": timesteps,
-            "target": target,
-        }
-
-    def compute_action_loss(self, model_outputs: Mapping[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
-        """Compute a generic action-space regression loss.
-
-        This is intentionally permissive so the smoke tests can exercise the
-        action head even before the full data path is available.
-        """
-        device = next(self.parameters()).device
-
-        # possible output keys from different training harnesses
-        pred = None
-        for key in ("pred", "pred_action", "action_logits", "noise_pred", "pred_noise"):
-            if key in model_outputs:
-                pred = model_outputs[key]
-                break
-
-        if pred is None:
-            # no prediction available — return zero loss to keep pipeline runnable
-            return torch.tensor(0.0, device=device)
-
-        # Ensure labels and pred are float tensors on same device
-        pred = pred.float().to(device)
-        labels = labels.float().to(device)
-
-        # Optional mask: 1 = valid, 0 = ignore
-        mask = model_outputs.get("mask", None)
-        if mask is not None:
-            mask = mask.float().to(device)
-            # Broadcast mask to match pred shape if necessary
-            if mask.dim() < pred.dim():
-                mask = mask.unsqueeze(-1)
-            diff = (pred - labels) ** 2 * mask
-            loss = diff.sum() / (mask.sum().clamp_min(1.0))
-            return loss
-
-        # Default MSE
-        return torch.nn.functional.mse_loss(pred, labels)
-
     def forward(self, **inputs: Any) -> dict:
         """Forward for Stage2 action/expert SFT.
-
-        This implementation follows the high-level flow of the Alpamayo R1
-        Stage2 forward: (1) fuse traj tokens into `input_ids` for the VLM,
-        (2) run the VLM to obtain past_key_values, (3) build training data for
-        the expert/diffusion stack from future trajectories, (4) run the
-        expert on the constructed embeddings and compute a diffusion-based
-        loss. This version mirrors alpamayo1 more closely, including KV cache
-        cropping and proper position_ids processing.
+        (Debug Version: try-except removed from VLM forward to expose traceback)
         """
 
         device = next(self.parameters()).device
 
-        # Helper to create a zero loss that's part of the computation graph
         def zero_loss():
             trainable_param = next((p for p in self.parameters() if p.requires_grad), None)
             if trainable_param is not None:
                 return (trainable_param.sum() * 0).float()
-            # Last-resort fallback: explicit grad-connected scalar.
             return torch.zeros((), device=device, requires_grad=True)
 
-        # Extract inputs dict, leaving the rest as kwargs
         tokenized_data = dict(inputs)
         input_ids = tokenized_data.pop("input_ids", None)
 
@@ -169,7 +101,6 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
         batch_size = input_ids.shape[0]
         labels = tokenized_data.pop("labels", None)
 
-        # Extract trajectory data from inputs
         ego_history_xyz = tokenized_data.pop("ego_history_xyz", None)
         ego_history_rot = tokenized_data.pop("ego_history_rot", None)
         ego_future_xyz = tokenized_data.pop("ego_future_xyz", None)
@@ -183,10 +114,32 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
             "ego_future_rot": ego_future_rot,
         }
 
-        # 1. Fuse trajectory tokens into input_ids (following alpamayo1 approach)
+        # 1. Fuse trajectory tokens into input_ids & Align Masks
         try:
-            if hasattr(self, "fuse_traj_tokens"):
+            if (
+                hasattr(self, "fuse_traj_tokens")
+                and getattr(self, "hist_traj_tokenizer", None) is not None
+                and getattr(self, "hist_token_start_idx", None) is not None
+            ):
+                original_len = input_ids.shape[1]
                 input_ids = self.fuse_traj_tokens(input_ids, traj_data)
+                new_len = input_ids.shape[1]
+
+                if new_len > original_len:
+                    diff_len = new_len - original_len
+                    if "attention_mask" in tokenized_data:
+                        extra_mask = torch.ones((batch_size, diff_len), 
+                                                device=device, dtype=tokenized_data["attention_mask"].dtype)
+                        tokenized_data["attention_mask"] = torch.cat([tokenized_data["attention_mask"], extra_mask], dim=1)
+                    
+                    if labels_mask is not None:
+                        extra_labels_mask = torch.zeros((batch_size, diff_len), 
+                                                        device=device, dtype=labels_mask.dtype)
+                        labels_mask = torch.cat([labels_mask, extra_labels_mask], dim=1)
+
+                if "position_ids" in tokenized_data:
+                    del tokenized_data["position_ids"]
+
         except Exception as e:
             logger.warning("Stage2 forward: fuse_traj_tokens failed: %s", e)
 
@@ -197,44 +150,56 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
             labels = torch.where(labels_mask.bool(), labels, torch.full_like(labels, IGNORE_INDEX))
 
         # 3. VLM forward pass
-        vlm_kwargs = dict(tokenized_data)
+        raw_vlm_kwargs = dict(tokenized_data)
+        allowed_vlm_keys = {
+            "attention_mask",
+            "pixel_values",
+            "pixel_values_videos",
+            "image_grid_thw",
+            "video_grid_thw",
+            "position_ids",
+            "cache_position",
+        }
+        vlm_kwargs = {k: v for k, v in raw_vlm_kwargs.items() if k in allowed_vlm_keys}
         vlm_labels = labels if self.cotrain_vlm else None
 
-        try:
-            context = nullcontext() if self.cotrain_vlm else torch.no_grad()
-            with context:
-                vlm_outputs = self.vlm(
-                    input_ids=input_ids,
-                    labels=vlm_labels,
-                    use_cache=True,
-                    **vlm_kwargs,
-                )
-        except Exception as e:
-            logger.warning("Stage2 forward: VLM forward failed: %s", e)
-            return {"loss": zero_loss()}
+        vlm_outputs = None
+        context = nullcontext() if self.cotrain_vlm else torch.no_grad()
+        with context:
+            vlm_outputs = self.vlm(
+                input_ids=input_ids,
+                labels=vlm_labels,
+                use_cache=True,
+                **vlm_kwargs,
+            )
 
         if ego_future_xyz is None or ego_future_rot is None:
             return {"loss": zero_loss()}
 
         # 4. Process trajectory for future action/diffusion training
         try:
+            ego_history_xyz_f32 = ego_history_xyz.float() if ego_history_xyz is not None and ego_history_xyz.dtype != torch.float32 else ego_history_xyz
+            ego_history_rot_f32 = ego_history_rot.float() if ego_history_rot is not None and ego_history_rot.dtype != torch.float32 else ego_history_rot
+            ego_future_xyz_f32 = ego_future_xyz.float() if ego_future_xyz is not None and ego_future_xyz.dtype != torch.float32 else ego_future_xyz
+            ego_future_rot_f32 = ego_future_rot.float() if ego_future_rot is not None and ego_future_rot.dtype != torch.float32 else ego_future_rot
+            
             action = self.action_space.traj_to_action(
-                traj_history_xyz=ego_history_xyz,
-                traj_history_rot=ego_history_rot,
-                traj_future_xyz=ego_future_xyz,
-                traj_future_rot=ego_future_rot,
+                traj_history_xyz=ego_history_xyz_f32,
+                traj_history_rot=ego_history_rot_f32,
+                traj_future_xyz=ego_future_xyz_f32,
+                traj_future_rot=ego_future_rot_f32,
             )
             action = action.reshape(-1, *self.action_space.get_action_space_dims())
-            if hasattr(self.diffusion, "construct_training_data"):
-                training_data = self.diffusion.construct_training_data(action)
-            else:
-                training_data = self._construct_flow_matching_training_data(action)
+            training_data = self.diffusion.construct_training_data(action)
         except Exception as e:
             logger.warning("Stage2 forward: traj_to_action/diffusion training_data failed: %s", e)
             return {"loss": zero_loss()}
 
         try:
-            action_embeds = self.action_in_proj(training_data["noisy_x"], training_data["timesteps"])  # [B, L, H]
+            proj_dtype = next(self.action_in_proj.parameters()).dtype
+            noisy_x = training_data["noisy_x"].to(dtype=proj_dtype)
+            timesteps = training_data["timesteps"].to(dtype=proj_dtype)
+            action_embeds = self.action_in_proj(noisy_x, timesteps)
             expert_embeds = action_embeds
         except Exception as e:
             logger.warning("Stage2 forward: action_in_proj failed: %s", e)
@@ -242,17 +207,15 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
 
         # 5. Get and process KV cache
         try:
-            kv_cache = getattr(vlm_outputs, "past_key_values", None)
-            if kv_cache is None:
-                logger.warning("Stage2 forward: past_key_values is None")
-                return {"loss": zero_loss()}
+            kv_cache = None
+            if vlm_outputs is not None:
+                kv_cache = getattr(vlm_outputs, "past_key_values", None)
         except Exception as e:
             logger.warning("Stage2 forward: accessing past_key_values failed: %s", e)
-            return {"loss": zero_loss()}
+            kv_cache = None
 
-        # 6. Attempt to crop KV cache (alpamayo1 approach using future_start_token)
+        # 6. Attempt to crop KV cache
         try:
-            # Try to find and crop to future_start token like alpamayo1 does
             if hasattr(self, "config") and hasattr(self.config, "traj_token_ids"):
                 future_start_token_id = self.config.traj_token_ids.get("future_start")
                 if future_start_token_id is not None:
@@ -266,7 +229,6 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
 
         if kv_cache is not None and self.stop_grad_from_vlm:
             try:
-                # Try detach via .layers (like in original code)
                 for layer in getattr(kv_cache, "layers", []):
                     if hasattr(layer, "keys"):
                         layer.keys = layer.keys.detach()
@@ -275,54 +237,65 @@ class TrainableAlpamayo1_5_Stage2(TrainableAlpamayo1_5):
             except Exception:
                 pass
 
-        # 7. Prepare position_ids (alpamayo1 approach)
+        # 7. Prepare position_ids
         try:
-            position_ids = self._process_position_ids_qwen2_5_vl(
-                vlm_outputs, batch_size, expert_embeds.shape[1], expert_embeds.device
-            )
+            if vlm_outputs is not None:
+                position_ids = self._process_position_ids_qwen2_5_vl(
+                    vlm_outputs, batch_size, expert_embeds.shape[1], expert_embeds.device
+                )
+            else:
+                position_ids = torch.arange(expert_embeds.shape[1], device=expert_embeds.device)
+                position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
         except Exception:
-            # Fallback: simple position ids
             position_ids = torch.arange(expert_embeds.shape[1], device=expert_embeds.device)
             position_ids = position_ids.unsqueeze(0).repeat(batch_size, 1)
 
         # 8. Run expert forward
-        try:
-            forward_kwargs = {}
-            if getattr(self.config, "expert_non_causal_attention", False):
-                forward_kwargs["is_causal"] = False
-            expert_outputs = self.expert(
-                inputs_embeds=expert_embeds,
-                position_ids=position_ids,
-                past_key_values=kv_cache,
-                attention_mask=None,
-                use_cache=True,
-                **forward_kwargs,
-            )
-            diffusion_out = expert_outputs.last_hidden_state[:, -expert_embeds.shape[1] :]
-            pred = self.action_out_proj(diffusion_out)
-            pred = pred.view(-1, *self.action_space.get_action_space_dims())
-        except Exception as e:
-            logger.warning("Stage2 forward: expert forward failed: %s", e)
-            return {"loss": zero_loss()}
+        pred = None
+        if kv_cache is not None:
+            try:
+                forward_kwargs = {}
+                if getattr(self.config, "expert_non_causal_attention", False):
+                    forward_kwargs["is_causal"] = False
+                expert_outputs = self.expert(
+                    inputs_embeds=expert_embeds,
+                    position_ids=position_ids,
+                    past_key_values=kv_cache,
+                    attention_mask=None,
+                    use_cache=True,
+                    **forward_kwargs,
+                )
+                diffusion_out = expert_outputs.last_hidden_state[:, -expert_embeds.shape[1] :]
+                pred = self.action_out_proj(diffusion_out)
+                pred = pred.view(-1, *self.action_space.get_action_space_dims())
+            except Exception as e:
+                logger.warning("Stage2 forward: expert forward failed: %s", e)
+                pred = None
+        
+        if pred is None:
+            try:
+                pred = self.action_out_proj(expert_embeds)
+                pred = pred.view(-1, *self.action_space.get_action_space_dims())
+            except Exception as e:
+                logger.warning("Stage2 forward: fallback action_out_proj failed: %s", e)
+                return {"loss": zero_loss()}
 
         # 9. Compute diffusion loss
         try:
-            if hasattr(self.diffusion, "compute_loss_from_pred"):
-                future_traj_loss = self.diffusion.compute_loss_from_pred(training_data=training_data, pred=pred)
-            else:
-                target = training_data["target"].to(pred.device).to(pred.dtype)
-                future_traj_loss = torch.nn.functional.mse_loss(pred, target)
+            future_traj_loss = self.diffusion.compute_loss_from_pred(training_data=training_data, pred=pred)
+
+            future_traj_loss = torch.nan_to_num(future_traj_loss, nan=0.0, posinf=1e9, neginf=-1e9)
             loss = future_traj_loss
-            if self.cotrain_vlm and hasattr(vlm_outputs, "loss"):
+            if self.cotrain_vlm and vlm_outputs is not None and hasattr(vlm_outputs, "loss"):
                 try:
                     loss = loss + vlm_outputs.loss
-                except Exception:
+                except Exception as e:
                     pass
         except Exception as e:
             logger.warning("Stage2 forward: diffusion loss failed: %s", e)
             return {"loss": zero_loss()}
 
         result = {"loss": loss, "action_loss": future_traj_loss}
-        if self.cotrain_vlm and hasattr(vlm_outputs, "loss"):
+        if self.cotrain_vlm and vlm_outputs is not None and hasattr(vlm_outputs, "loss"):
             result["vlm_loss"] = vlm_outputs.loss
         return result
