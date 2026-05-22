@@ -444,41 +444,11 @@ def train(cfg: DictConfig) -> None:
     eval_steps_val = _get(training_cfg, "eval_steps")
     eval_steps = int(eval_steps_val) if eval_steps_val is not None else None
 
-    # Add timestamp to output_dir and synchronize across distributed ranks
-    output_dir_base = str(_get(training_cfg, "output_dir", "outputs/stage2"))
-    run_timestamp = None
-    try:
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size > 1:
-            import torch.distributed as dist
-
-            if not dist.is_available():
-                raise RuntimeError("torch.distributed not available")
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    backend="nccl" if torch.cuda.is_available() else "gloo",
-                    init_method="env://",
-                )
-
-            if rank == 0:
-                ts_int = int(time.time())
-                ts_tensor = torch.tensor([ts_int], dtype=torch.long)
-            else:
-                ts_tensor = torch.tensor([0], dtype=torch.long)
-
-            dist.broadcast(ts_tensor, src=0)
-            run_timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(int(ts_tensor.item())))
-        else:
-            run_timestamp = time.strftime("%Y%m%d_%H%M%S")
-    except Exception:
-        run_timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    output_dir_with_timestamp = f"{output_dir_base}_{run_timestamp}"
-    logger.info(f"Output directory with timestamp: {output_dir_with_timestamp}")
+    output_dir = str(_get(training_cfg, "output_dir", "outputs/stage2"))
+    logger.info("Output directory: %s", output_dir)
 
     training_args = TrainingArguments(
-        output_dir=output_dir_with_timestamp,
+        output_dir=output_dir,
         per_device_train_batch_size=int(_get(training_cfg, "per_device_train_batch_size", 1)),
         gradient_accumulation_steps=int(_get(training_cfg, "gradient_accumulation_steps", 1)),
         learning_rate=float(_get(training_cfg, "learning_rate", 1e-5)),

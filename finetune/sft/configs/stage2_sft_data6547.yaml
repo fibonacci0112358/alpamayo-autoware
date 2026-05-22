@@ -1,0 +1,100 @@
+# Stage2 Alpamayo1.5 SFT config for H100 8GPU with Stage1 pretrained weights
+#
+# Validation is kept at about 20% by holding out larger IDs only:
+# valid_local_dir_names: ["014", "018", "021"]
+# train_local_dir_names: all remaining IDs
+#
+# Train samples: 6547
+# Valid samples: 1652
+# Total samples: 8199
+#
+# Uses the Stage1 output directory for initialization.
+
+defaults: []
+
+model:
+  _target_: finetune.sft.models.sft_alpamayo_1_5_stage2.TrainableAlpamayo1_5_Stage2
+  config:
+    # Load from the matching Stage1 checkpoint/output as VLM backbone
+    vlm_name_or_path: /mnt/nvme/alpamayo_outputs/stage1_sft_data6547
+    vlm_backend: qwenvl3
+    traj_vocab_size: 768
+    tokens_per_history_traj: 16
+    tokens_per_future_traj: 64
+    vocab_size: 155697
+    model_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    add_special_tokens: false
+    # Action space configuration (from stage1)
+    action_space_cfg:
+      _target_: alpamayo1_5.action_space.unicycle_accel_curvature.UnicycleAccelCurvatureActionSpace
+    # Diffusion configuration (from stage1)
+    diffusion_cfg:
+      _target_: alpamayo1_5.diffusion.flow_matching.FlowMatching
+    # Action projection modules
+    action_in_proj_cfg:
+      _target_: alpamayo1_5.models.action_in_proj.PerWaypointActionInProjV2
+    action_out_proj_cfg:
+      _target_: torch.nn.Linear
+  gradient_checkpointing: false
+  cotrain_vlm: false
+  stop_grad_from_vlm: true
+  stage1_vlm_checkpoint_path: null
+
+lora:
+  use_lora: false
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+
+data:
+  manifest_path: null
+  # Use folder-based data loading like Stage1 (same data split as Stage1)
+  local_dir: null
+  local_dir_root: /mnt/nvme/alpamayo_data
+  train_local_dir_names: ["001", "002", "003", "004", "005", "006", "007", "008", "009", "010", "011", "012", "013", "015", "016", "017", "019", "020", "022", "023", "024", "025", "026"]
+  valid_local_dir_names: ["014", "018", "021"]
+  image_root: null
+  chunk_ids: null
+  train_chunk_ids: null
+  valid_chunk_ids: null
+  train_file_start: null
+  train_file_end: null
+  valid_file_start: null
+  valid_file_end: null
+  use_default_keyframe: false
+  features_metadata: features.csv
+  clip_index_metadata: clip_index.parquet
+  num_frames_per_camera: 4
+  num_history_steps: 16
+  num_future_steps: 64
+  time_step: 0.1
+  nav_text: null
+  completion: null
+
+training:
+  output_dir: /mnt/nvme/alpamayo_outputs/stage2_sft_data6547
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-5
+  num_train_epochs: 3.0
+  max_steps: -1
+  logging_steps: 10
+  save_strategy: "epoch"
+  save_total_limit: 3
+  eval_strategy: "no"
+  eval_steps: null
+  early_stopping_patience: null
+  early_stopping_threshold: 0.0
+  load_best_model_at_end: false
+  metric_for_best_model: eval_loss
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  dataloader_num_workers: 2
+  dataloader_pin_memory: true
+  dataloader_persistent_workers: true
+  report_to: []
+  optim: adamw_torch
+  warmup_ratio: 0.03
+  deepspeed: finetune/sft/configs/deepspeed/zero2.json
