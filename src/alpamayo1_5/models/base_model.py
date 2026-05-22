@@ -33,6 +33,7 @@ from transformers import (
     Qwen3VLForConditionalGeneration,
 )
 
+from alpamayo1_5.models.delta_tokenizer import DeltaTrajectoryTokenizer
 from alpamayo1_5.models.token_utils import extract_text_tokens
 
 logger = logging.getLogger(__name__)
@@ -134,12 +135,21 @@ class TrajectoryFusionMixin:
     def _validate_mixin_requirements(self, require_future: bool = False) -> dict[str, Any]:
         """Validate that all required mixin attributes are present."""
         hist_traj_tokenizer = getattr(self, "hist_traj_tokenizer", None)
+        # Fallback to the trajectory tokenizer if a dedicated history tokenizer
+        # wasn't configured. This matches the trajectory placeholder format.
+        if hist_traj_tokenizer is None:
+            hist_traj_tokenizer = getattr(self, "traj_tokenizer", None)
         if hist_traj_tokenizer is None:
             raise AttributeError("TrajectoryFusionMixin requires 'hist_traj_tokenizer' attribute")
 
         hist_token_start_idx = getattr(self, "hist_token_start_idx", None)
         if hist_token_start_idx is None:
-            raise AttributeError("TrajectoryFusionMixin requires 'hist_token_start_idx' attribute")
+            # Fallback to config-provided token start index if present
+            config = getattr(self, "config", None)
+            if config is not None and hasattr(config, "traj_token_start_idx"):
+                hist_token_start_idx = config.traj_token_start_idx
+            else:
+                raise AttributeError("TrajectoryFusionMixin requires 'hist_token_start_idx' attribute")
 
         config = getattr(self, "config", None)
         if config is None or not hasattr(config, "traj_token_ids"):
@@ -158,9 +168,14 @@ class TrajectoryFusionMixin:
 
             future_token_start_idx = getattr(self, "future_token_start_idx", None)
             if future_token_start_idx is None:
-                raise AttributeError(
-                    "Requires 'future_token_start_idx' attribute for future trajectories"
-                )
+                # Fallback to config
+                config = getattr(self, "config", None)
+                if config is not None and hasattr(config, "traj_token_start_idx"):
+                    future_token_start_idx = config.traj_token_start_idx
+                else:
+                    raise AttributeError(
+                        "Requires 'future_token_start_idx' attribute for future trajectories"
+                    )
 
             result.update(
                 {
@@ -246,6 +261,17 @@ class ReasoningVLAConfig(PretrainedConfig):
 
     def _initialize_vlm_config(self) -> None:
         """Initialize VLM-specific configuration based on backend type."""
+        # Allow runtime override via environment variable to support
+        # loading configs that reference machine-local absolute paths
+        # from another host. This makes the build script resilient when
+        # the saved config.vlm_name_or_path points to a non-existent
+        # location on the current machine.
+        from os import environ
+
+        env_vlm = environ.get("ALPAMAYO_VLM_NAME_OR_PATH")
+        if env_vlm:
+            self.vlm_name_or_path = env_vlm
+
         if self.vlm_name_or_path is None:
             return
 
@@ -283,7 +309,11 @@ class ReasoningVLAConfig(PretrainedConfig):
         if self.traj_vocab_size is not None:
             discrete_tokens = [f"<i{v}>" for v in range(self.traj_vocab_size)]
             num_new_tokens = tokenizer.add_tokens(discrete_tokens)
-            assert len(discrete_tokens) == num_new_tokens
+            if num_new_tokens != len(discrete_tokens):
+                logger.warning(
+                    "Requested %d trajectory tokens but only %d were added — some tokens may already exist."
+                    % (len(discrete_tokens), num_new_tokens)
+                )
             tokenizer.traj_token_start_idx = tokenizer.convert_tokens_to_ids("<i0>")
             tokenizer.traj_token_end_idx = tokenizer.convert_tokens_to_ids(
                 f"<i{self.traj_vocab_size - 1}>"
@@ -369,7 +399,12 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
 
         if config.traj_vocab_size is not None:
             discrete_tokens = [f"<i{v}>" for v in range(config.traj_vocab_size)]
-            tokenizer.add_tokens(discrete_tokens)
+            num_new_tokens = tokenizer.add_tokens(discrete_tokens)
+            if num_new_tokens != len(discrete_tokens):
+                logger.warning(
+                    "Requested %d trajectory tokens but only %d were added — some tokens may already exist."
+                    % (len(discrete_tokens), num_new_tokens)
+                )
             tokenizer.traj_token_start_idx = tokenizer.convert_tokens_to_ids("<i0>")
 
         if config.add_special_tokens:
@@ -411,6 +446,10 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
             attn_implementation=config.attn_implementation,
             local_files_only=local_only,
         )
+        # Ensure rope_scaling is a dict (some saved configs may have None)
+        if getattr(vlm_config, "text_config", None) is not None:
+            if getattr(vlm_config.text_config, "rope_scaling", None) is None:
+                vlm_config.text_config.rope_scaling = {}
         self.original_vocab_size = vlm_config.text_config.vocab_size
         vlm_config.text_config.vocab_size = config.vocab_size
         vlm_config.vocab_size = config.vocab_size
@@ -425,7 +464,7 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         elif config.traj_tokenizer_cfg is not None:
             self.traj_tokenizer = hyu.instantiate(config.traj_tokenizer_cfg, load_weights=False)
         else:
-            self.traj_tokenizer = None
+            self.traj_tokenizer = DeltaTrajectoryTokenizer(num_bins=config.traj_vocab_size)
 
         self.future_token_start_idx = self.hist_token_start_idx = config.traj_token_start_idx
 
@@ -461,6 +500,8 @@ class ReasoningVLA(PreTrainedModel, TrajectoryFusionMixin):
         if config.traj_tokenizer_cfg is not None:
             traj_tokenizer = hyu.instantiate(config.traj_tokenizer_cfg)
             pretrained_modules["traj_tokenizer"] = traj_tokenizer
+        else:
+            pretrained_modules["traj_tokenizer"] = DeltaTrajectoryTokenizer(num_bins=config.traj_vocab_size)
 
         return cls(
             config,

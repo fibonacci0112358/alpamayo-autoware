@@ -8,8 +8,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import onnx
 import torch
 from onnxruntime.quantization import CalibrationMethod
+from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
+from onnx import numpy_helper
 
 from alpamayo1_5 import helper
 from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset
@@ -26,7 +29,6 @@ from alpamayo1_5.trt.export import (
 
 DEFAULT_CLIP_ID = "030c760c-ae38-49aa-9ad8-f5650a545d26"
 DEFAULT_T0_US = 5_100_000
-DEFAULT_OUTPUT_DIR = "~/autoware_data/alpamayo/v0.1"
 
 
 class CalibrationCollector:
@@ -75,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         default="nvidia/Alpamayo-1.5-10B",
         help="Deprecated alias for --model-name-or-path.",
     )
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--clip-id", default=DEFAULT_CLIP_ID)
     parser.add_argument("--t0-us", type=int, default=DEFAULT_T0_US)
     parser.add_argument("--max-generation-length", type=int, default=64)
@@ -175,22 +177,14 @@ def main() -> None:
         calibration_sample_paths=collector.sample_paths,
         calibration_method=calibration_method_from_name(args.calibration_method),
         smoothquant_alpha=args.smoothquant_alpha,
-        smoothquant_provider="CUDAExecutionProvider",
+        smoothquant_provider="CPUExecutionProvider",
         calibration_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
 
     onnx_model_path = layout["int8_onnx"]
-    
-    # 変更点
-    import onnx
-    from onnx import numpy_helper
-    import os
 
     print("TensorRT互換性のため、モデル構造を安全にOpset 14へ調整しています...")
-    onnx_path = "engines/expert_step.int8.qdq.onnx"
-    base_dir = os.path.dirname(onnx_path) or "."
-    
-    m = onnx.load(onnx_path, load_external_data=False)
+    m = onnx.load(str(onnx_model_path), load_external_data=False)
 
     for imp in m.opset_import:
         if imp.domain == "" or imp.domain == "ai.onnx":
@@ -204,13 +198,13 @@ def main() -> None:
     constants = {}
     for init in m.graph.initializer:
         if init.name in target_constant_names:
-            constants[init.name] = numpy_helper.to_array(init, base_dir=base_dir)
+            constants[init.name] = numpy_helper.to_array(init)
 
     for node in m.graph.node:
         if node.op_type == "Constant" and node.output[0] in target_constant_names:
             for attr in node.attribute:
                 if attr.name == "value":
-                    constants[node.output[0]] = numpy_helper.to_array(attr.t, base_dir=base_dir)
+                    constants[node.output[0]] = numpy_helper.to_array(attr.t)
 
     for node in m.graph.node:
         if node.op_type == "ScatterND":
@@ -232,8 +226,20 @@ def main() -> None:
             del node.attribute[:]
             node.attribute.extend(new_attrs)
 
-    onnx.save(m, onnx_path)
-    # === ここまで追加 ===
+    inferred = onnx.shape_inference.infer_shapes(m)
+    try:
+        inferred = SymbolicShapeInference(
+            int_max=2**31 - 1,
+            auto_merge=True,
+            guess_output_rank=True,
+            verbose=0,
+        ).infer_shapes(inferred)
+    except Exception as exc:
+        print(
+            "WARNING: symbolic shape inference was incomplete; continuing with the "
+            f"best-effort ONNX shape metadata. Details: {exc}"
+        )
+    onnx.save(inferred, str(onnx_model_path))
 
     trt_engine = TrtExpertEngine(
         onnx_model_path=onnx_model_path,

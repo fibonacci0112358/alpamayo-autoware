@@ -4,9 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+if [[ -z "${PYTHON_BIN:-}" && -x "${REPO_ROOT}/.venv-trt/bin/python" ]]; then
+  PYTHON_BIN="${REPO_ROOT}/.venv-trt/bin/python"
+fi
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-OUTPUT_DIR=""
-MODEL_NAME_OR_PATH="nvidia/Alpamayo-1.5-10B"
+OUTPUT_DIR="${HOME}/test_repo/engines"
+MODEL_NAME_OR_PATH="${HOME}/test_repo/stage2_h100_8gpu_full_folders"
+PYTHON_PATH=""
+VLM_NAME_OR_PATH=""
 CLIP_ID="030c760c-ae38-49aa-9ad8-f5650a545d26"
 T0_US="5100000"
 MAX_GENERATION_LENGTH="64"
@@ -16,7 +21,6 @@ SMOOTHQUANT_ALPHA="0.6"
 SEED="0"
 SKIP_VALIDATION="false"
 INSTALL_DEPS="false"
-TMUX_SESSION="alpamayo-trt-build"
 
 usage() {
   cat <<EOF
@@ -37,8 +41,8 @@ Options:
   --seed <value>                     Random seed
   --skip-validation                  Skip native-vs-TRT validation pass
   --python-bin <path>                Python executable to use (default: python3)
+  --python-path <path>               Additional Python source path (prepended to PYTHONPATH)
   --install-deps                     Run: uv pip install -r scripts/requirements-trt-build.txt
-  --tmux-session <name>              tmux session name (default: alpamayo-trt-build)
   -h, --help                         Show this help
 
 Examples:
@@ -101,13 +105,17 @@ while [[ $# -gt 0 ]]; do
       PYTHON_BIN="$2"
       shift 2
       ;;
+    --python-path)
+      PYTHON_PATH="$2"
+      shift 2
+      ;;
+    --vlm-name-or-path)
+      VLM_NAME_OR_PATH="$2"
+      shift 2
+      ;;
     --install-deps)
       INSTALL_DEPS="true"
       shift
-      ;;
-    --tmux-session)
-      TMUX_SESSION="$2"
-      shift 2
       ;;
     -h|--help)
       usage
@@ -129,9 +137,38 @@ fi
 
 cd "${REPO_ROOT}"
 
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "Error: tmux is not installed or not in PATH." >&2
-  exit 1
+# Set PYTHONPATH so local `src/` package modules (e.g. alpamayo1_5) are importable.
+if [[ -n "${PYTHON_PATH}" ]]; then
+  export PYTHONPATH="${PYTHON_PATH}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/build:${PYTHONPATH:-}"
+fi
+
+cuda_lib_dirs=()
+if [[ -d "${REPO_ROOT}/.venv-trt/lib/python3.12/site-packages/nvidia" ]]; then
+  while IFS= read -r -d '' lib_dir; do
+    cuda_lib_dirs+=("${lib_dir}")
+  done < <(find "${REPO_ROOT}/.venv-trt/lib/python3.12/site-packages/nvidia" -type d -name lib -print0)
+fi
+if [[ -d "${REPO_ROOT}/.venv-trt/lib/python3.12/site-packages/torch/lib" ]]; then
+  cuda_lib_dirs+=("${REPO_ROOT}/.venv-trt/lib/python3.12/site-packages/torch/lib")
+fi
+if [[ -d "/usr/local/cuda/targets/x86_64-linux/lib" ]]; then
+  cuda_lib_dirs+=("/usr/local/cuda/targets/x86_64-linux/lib")
+fi
+if [[ ${#cuda_lib_dirs[@]} -gt 0 ]]; then
+  cuda_ld_path=$(IFS=:; echo "${cuda_lib_dirs[*]}")
+  if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    export LD_LIBRARY_PATH="${cuda_ld_path}:${LD_LIBRARY_PATH}"
+  else
+    export LD_LIBRARY_PATH="${cuda_ld_path}"
+  fi
+fi
+echo "PYTHONPATH=${PYTHONPATH}"
+echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+if [[ -n "${VLM_NAME_OR_PATH}" ]]; then
+  export ALPAMAYO_VLM_NAME_OR_PATH="${VLM_NAME_OR_PATH}"
+  echo "ALPAMAYO_VLM_NAME_OR_PATH=${ALPAMAYO_VLM_NAME_OR_PATH}"
 fi
 
 cmd=(
@@ -151,12 +188,6 @@ if [[ "${SKIP_VALIDATION}" == "true" ]]; then
   cmd+=(--skip-validation)
 fi
 
-if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-  echo "Error: tmux session '${TMUX_SESSION}' already exists." >&2
-  echo "Use a different name with --tmux-session or attach with: tmux attach -t ${TMUX_SESSION}" >&2
-  exit 1
-fi
-
 printf -v build_cmd '%q ' "${cmd[@]}"
 run_cmd="set -euo pipefail; cd $(printf '%q' "${REPO_ROOT}");"
 if [[ "${INSTALL_DEPS}" == "true" ]]; then
@@ -164,8 +195,20 @@ if [[ "${INSTALL_DEPS}" == "true" ]]; then
 fi
 run_cmd+=" ${build_cmd}"
 
-tmux new-session -d -s "${TMUX_SESSION}" "bash -lc $(printf '%q' "${run_cmd}")"
+echo "Starting TensorRT build (foreground)."
+if ! ${PYTHON_BIN} -c "import torchvision" >/dev/null 2>&1; then
+  cat <<MSG
+Missing Python dependency: torchvision
 
-echo "Started TensorRT build in tmux session: ${TMUX_SESSION}"
-echo "Attach: tmux attach -t ${TMUX_SESSION}"
-echo "Detach: Ctrl+b then d"
+The build requires 'torchvision' for some image/video processors. Install a
+version matching your installed 'torch' (GPU vs CPU/CUDA) before continuing.
+Example:
+  python -m pip install torchvision
+
+Refer to: https://pytorch.org/get-started/locally/ for platform-specific wheels.
+
+You can also let this script install deps by re-running with '--install-deps'.
+MSG
+  exit 1
+fi
+bash -lc "${run_cmd}"
