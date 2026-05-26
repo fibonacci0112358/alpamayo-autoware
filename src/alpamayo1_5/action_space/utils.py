@@ -22,6 +22,16 @@ from alpamayo1_5.geometry.rotation import round_2pi_torch, so3_to_yaw_torch
 logger = logging.getLogger(__name__)
 
 
+def _cholesky_solve(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve an SPD system in float32 and cast the result back."""
+    solve_dtype = lhs.dtype
+    lhs_32 = lhs.float()
+    rhs_32 = rhs.float()
+    L = torch.linalg.cholesky(lhs_32)
+    x = torch.cholesky_solve(rhs_32.unsqueeze(-1), L).squeeze(-1)
+    return x.to(dtype=solve_dtype)
+
+
 def unwrap_angle(phi: torch.Tensor) -> torch.Tensor:
     """Unwrap the last dimension of the tensor to make sure the diff is in (-pi, pi]."""
     d = torch.diff(phi, dim=-1)
@@ -227,8 +237,7 @@ def solve_single_constraint(
     # strip off the x_init term
     lhs = ATA + DTD[..., 1:, 1:] + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    x = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    x = _cholesky_solve(lhs, rhs)  # (..., N)
 
     x = torch.cat([x_init.unsqueeze(-1), x], dim=-1)  # (..., N+1)
     return x
@@ -295,21 +304,21 @@ def solve_xs_eq_y(
 
     # NOTE: Since there is no terminal constraint, we need to handle the singularity case by
     # increasing the ridge term.
-    L = None
-    while L is None:
+    x = None
+    while x is None:
         try:
             ridge_term = ridge * torch.eye(N, dtype=dtype, device=device).expand(*lead, N, N)
             lhs = ATA + DTD + ridge_term
             # Ensure dtype consistency for torch.compile fake tensor meta pass
             if rhs.dtype != lhs.dtype:
                 rhs = rhs.to(lhs.dtype)
-            L = torch.linalg.cholesky(lhs)
+            x = _cholesky_solve(lhs, rhs)
         except RuntimeError as e:
             logger.error(f"Error in cholesky decomposition: {e}", exc_info=True)
             ridge *= 10
             logger.warning(f"Resolving singularity using ridge {ridge}")
 
-    return torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    return x  # (..., N)
 
 
 @torch.no_grad()
@@ -392,8 +401,7 @@ def dxy_theta_to_v_without_v0(
     # strip off the x_init term
     lhs = ATA + DTD + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    y = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N+1)
+    y = _cholesky_solve(lhs, rhs)  # (..., N+1)
 
     return y  # (..., N+1)
 
@@ -478,8 +486,7 @@ def dxy_theta_to_v(
     # strip off the x_init term
     lhs = ATA[..., 1:, 1:] + DTD[..., 1:, 1:] + ridge_term
 
-    L = torch.linalg.cholesky(lhs)
-    y = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (..., N)
+    y = _cholesky_solve(lhs, rhs)  # (..., N)
 
     return torch.cat([v0.unsqueeze(-1), y], dim=-1)  # (..., N+1)
 

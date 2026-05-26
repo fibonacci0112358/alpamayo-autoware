@@ -162,8 +162,11 @@ class TrajectoryFusionMixin:
     def _validate_mixin_requirements(self, require_future: bool = False) -> dict[str, Any]:
         """Validate that all required mixin attributes are present."""
         hist_traj_tokenizer = getattr(self, "hist_traj_tokenizer", None)
+        traj_tokenizer = getattr(self, "traj_tokenizer", None)
         if hist_traj_tokenizer is None:
-            raise AttributeError("TrajectoryFusionMixin requires 'hist_traj_tokenizer' attribute")
+            hist_traj_tokenizer = traj_tokenizer
+        if hist_traj_tokenizer is None:
+            raise AttributeError("TrajectoryFusionMixin requires 'traj_tokenizer' or 'hist_traj_tokenizer' attribute")
 
         hist_token_start_idx = getattr(self, "hist_token_start_idx", None)
         if hist_token_start_idx is None:
@@ -180,7 +183,6 @@ class TrajectoryFusionMixin:
         }
 
         if require_future:
-            traj_tokenizer = getattr(self, "traj_tokenizer", None)
             if traj_tokenizer is None:
                 raise AttributeError("Requires 'traj_tokenizer' attribute for future trajectories")
 
@@ -219,7 +221,12 @@ class TrajectoryFusionMixin:
             return input_ids
 
         has_future = "ego_future_xyz" in traj_data and traj_data["ego_future_xyz"] is not None
-        attrs = self._validate_mixin_requirements(require_future=has_future)
+        try:
+            attrs = self._validate_mixin_requirements(require_future=has_future)
+        except AttributeError:
+            # Missing tokenizer(s) — skip trajectory fusion and proceed with original input_ids.
+            print("Warning: trajectory fusion skipped because tokenizer attributes are missing on the model.")
+            return input_ids
 
         hist_idx = tokenize_history_trajectory(
             attrs["hist_traj_tokenizer"], traj_data, attrs["hist_token_start_idx"]
